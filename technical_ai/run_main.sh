@@ -65,7 +65,7 @@ python main.py \
 --cost_penalty 0.0 \
 --learning_rate 0.0001 \
 --start 2016/01/01 \
---end 2018/01/01 \
+--end 2017/12/30 \
 --model_dir ${SAVE_MODEL_DIR} \
 --model_name ${MODEL_NAME} \
 --model_index ${MODEL_INDEX} \
