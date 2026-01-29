@@ -33,7 +33,10 @@ cudnn 7.4.1
 
 # Dataset
 
-The raw data of Crypto-A is accessed with Poloniex[<sup>[2]</sup>](#refer-anchor-2). We provide the Crypto-A dataset in link[<sup>[3]</sup>](#refer-anchor-3), where data selection is based on the method in [<sup>[4]</sup>](#refer-anchor-4). Please download the database and save it to ./database in the same directory as the main.py. The statistics of Crypto-A are summarized as below.
+The raw data of Crypto-A is accessed with Poloniex[<sup>[2]</sup>](#refer-anchor-2). We provide the Crypto-A dataset in link[<sup>[3]</sup>](#refer-anchor-3), where data selection is based on the method in [<sup>[4]</sup>](#refer-anchor-4). Please download the Data.db and save it to ./database in the same directory as the main.py. For Google Colab create a new folder called database in the same directory as main.py, then upload the Data.db file in database folder.
+
+
+The statistics of Crypto-A are summarized as below.
 | Dataset|Assets| Training | Test|
 | ---------- | :-----------: | :-----------: |:-----------: |
 |Crypto-A|12|2016.01-2017.11|2017.11-2018.01|
