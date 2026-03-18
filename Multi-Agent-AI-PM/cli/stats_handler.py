@@ -16,6 +16,16 @@ class StatsCallbackHandler(BaseCallbackHandler):
         self.tool_calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
+        self._seen_runs = set()
+
+    def clear(self) -> None:
+        """Reset all statistics to zero."""
+        with self._lock:
+            self.llm_calls = 0
+            self.tool_calls = 0
+            self.tokens_in = 0
+            self.tokens_out = 0
+            self._seen_runs.clear()
 
     def on_llm_start(
         self,
@@ -24,7 +34,12 @@ class StatsCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Increment LLM call counter when an LLM starts."""
+        run_id = kwargs.get("run_id")
         with self._lock:
+            if run_id and run_id in self._seen_runs:
+                return
+            if run_id:
+                self._seen_runs.add(run_id)
             self.llm_calls += 1
 
     def on_chat_model_start(
@@ -34,7 +49,12 @@ class StatsCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Increment LLM call counter when a chat model starts."""
+        run_id = kwargs.get("run_id")
         with self._lock:
+            if run_id and run_id in self._seen_runs:
+                return
+            if run_id:
+                self._seen_runs.add(run_id)
             self.llm_calls += 1
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:

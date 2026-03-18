@@ -215,5 +215,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Saved CLI config (contains API keys)
+cli/.saved_config.json
+
 # Cache
 **/data_cache/
+
+ eval_results

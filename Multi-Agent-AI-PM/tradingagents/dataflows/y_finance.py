@@ -462,3 +462,176 @@ def get_insider_transactions(
         
     except Exception as e:
         return f"Error retrieving insider transactions for {ticker}: {str(e)}"
+
+
+def screen_stocks(
+    query=None,
+    size: int = 100,
+    sort_field: str = "ticker",
+    sort_asc: bool = False,
+):
+    """Screen stocks using yfinance screener.
+
+    Args:
+        query: A predefined screener name (str) or a yf.EquityQuery object.
+               Predefined names: 'aggressive_small_caps', 'day_gainers', 'day_losers',
+               'growth_technology_stocks', 'most_actives', 'undervalued_growth_stocks'.
+        size: Number of results (max 250).
+        sort_field: Column to sort by.
+        sort_asc: Sort ascending if True.
+
+    Returns:
+        Dict with 'tickers' (list[str]) and 'data' (list[dict]) of screened stocks.
+    """
+    import time
+
+    kwargs = {"sortField": sort_field, "sortAsc": sort_asc}
+    if isinstance(query, str):
+        kwargs["query"] = query
+        kwargs["count"] = min(size, 250)
+    else:
+        kwargs["query"] = query
+        kwargs["size"] = min(size, 250)
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = yf.screen(**kwargs)
+
+            if not result or "quotes" not in result:
+                return {"tickers": [], "data": []}
+
+            quotes = result["quotes"]
+            tickers = [q.get("symbol", "") for q in quotes if q.get("symbol")]
+            return {"tickers": tickers, "data": quotes}
+
+        except Exception as e:
+            err_str = str(e)
+            if "Rate" in err_str or "429" in err_str or "Too Many" in err_str:
+                wait = 5 * (attempt + 1)
+                print(f"Rate limited on screen attempt {attempt + 1}/{max_retries}, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            print(f"Error screening stocks: {e}")
+            return {"tickers": [], "data": []}
+
+    print("Error screening stocks: rate limit retries exhausted")
+    return {"tickers": [], "data": []}
+
+
+def get_sector_top_companies(
+    sector_key: Annotated[str, "sector key, e.g. 'technology', 'healthcare'"],
+):
+    """Get top companies in a sector from yfinance.
+
+    Valid sector keys: basic-materials, communication-services, consumer-cyclical,
+    consumer-defensive, energy, financial-services, healthcare, industrials,
+    real-estate, technology, utilities.
+    """
+    try:
+        sector = yf.Sector(sector_key)
+        data = sector.top_companies
+
+        if data is None or data.empty:
+            return f"No top companies data for sector '{sector_key}'"
+
+        return data.reset_index().to_dict(orient="records")
+
+    except Exception as e:
+        return f"Error getting sector top companies for {sector_key}: {str(e)}"
+
+
+def get_industry_top_companies(
+    industry_key: Annotated[str, "industry key, e.g. 'semiconductors'"],
+):
+    """Get top and top growth companies in an industry from yfinance."""
+    try:
+        industry = yf.Industry(industry_key)
+        result = {}
+
+        top = industry.top_companies
+        if top is not None and not top.empty:
+            result["top_companies"] = top.reset_index().to_dict(orient="records")
+
+        growth = industry.top_growth_companies
+        if growth is not None and not growth.empty:
+            result["top_growth_companies"] = growth.reset_index().to_dict(orient="records")
+
+        if not result:
+            return f"No company data for industry '{industry_key}'"
+
+        return result
+
+    except Exception as e:
+        return f"Error getting industry companies for {industry_key}: {str(e)}"
+
+
+def get_analyst_recommendations(
+    ticker: Annotated[str, "ticker symbol of the company"],
+):
+    """Get analyst recommendations summary and price targets from yfinance."""
+    try:
+        ticker_obj = yf.Ticker(ticker.upper())
+        result = {}
+
+        try:
+            recs = ticker_obj.get_recommendations_summary()
+            if recs is not None and not recs.empty:
+                result["recommendations"] = recs.to_dict(orient="records")
+        except Exception:
+            pass
+
+        try:
+            targets = ticker_obj.get_analyst_price_targets()
+            if targets:
+                result["price_targets"] = targets
+        except Exception:
+            pass
+
+        if not result:
+            return f"No analyst data for '{ticker}'"
+
+        header = f"# Analyst Recommendations for {ticker.upper()}\n"
+        header += f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+        lines = []
+        if "recommendations" in result:
+            lines.append("## Recommendations Summary")
+            for rec in result["recommendations"]:
+                lines.append(str(rec))
+
+        if "price_targets" in result:
+            lines.append("\n## Price Targets")
+            targets = result["price_targets"]
+            if isinstance(targets, dict):
+                for k, v in targets.items():
+                    lines.append(f"  {k}: {v}")
+            else:
+                lines.append(str(targets))
+
+        return header + "\n".join(lines)
+
+    except Exception as e:
+        return f"Error getting analyst recommendations for {ticker}: {str(e)}"
+
+
+def get_growth_estimates(
+    ticker: Annotated[str, "ticker symbol of the company"],
+):
+    """Get growth estimates from yfinance (stock, industry, sector, index)."""
+    try:
+        ticker_obj = yf.Ticker(ticker.upper())
+        data = ticker_obj.get_growth_estimates()
+
+        if data is None or (hasattr(data, "empty") and data.empty):
+            return f"No growth estimates for '{ticker}'"
+
+        header = f"# Growth Estimates for {ticker.upper()}\n"
+        header += f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+        if hasattr(data, "to_csv"):
+            return header + data.to_csv()
+        return header + str(data)
+
+    except Exception as e:
+        return f"Error getting growth estimates for {ticker}: {str(e)}"

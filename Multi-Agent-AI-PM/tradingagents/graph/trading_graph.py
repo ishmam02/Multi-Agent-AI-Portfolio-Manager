@@ -3,12 +3,16 @@
 import os
 from pathlib import Path
 import json
+import time
 from datetime import date
 from typing import Dict, Any, Tuple, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.llm_clients.rate_limiter import create_rate_limiter
 
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -19,6 +23,8 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.graph.signal_processing import SignalProcessor
+
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -30,7 +36,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_news,
     get_insider_transactions,
-    get_global_news
+    get_global_news,
 )
 
 from .conditional_logic import ConditionalLogic
@@ -38,6 +44,8 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+from tradingagents.graph.stock_screener import StockScreener
+from tradingagents.dataflows.alpaca import get_open_positions
 
 
 class TradingAgentsGraph:
@@ -46,6 +54,7 @@ class TradingAgentsGraph:
     def __init__(
         self,
         selected_analysts=["market", "social", "news", "fundamentals"],
+        risk_profile=None,
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
@@ -54,6 +63,7 @@ class TradingAgentsGraph:
 
         Args:
             selected_analysts: List of analyst types to include
+            risk_profile: User's investment risk profile dict
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
@@ -61,6 +71,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.risk_profile = risk_profile
 
         # Update the interface's config
         set_config(self.config)
@@ -78,6 +89,11 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
+        # Add rate limiter if configured (shared across both LLMs)
+        rpm = self.config.get("rate_limit_rpm")
+        if rpm:
+            llm_kwargs["rate_limiter"] = create_rate_limiter(rpm)
+
         deep_client = create_llm_client(
             provider=self.config["llm_provider"],
             model=self.config["deep_think_llm"],
@@ -93,13 +109,17 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
-        
+
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
         self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
         self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
-        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config)
+        self.invest_judge_memory = FinancialSituationMemory(
+            "invest_judge_memory", self.config
+        )
+        self.risk_manager_memory = FinancialSituationMemory(
+            "risk_manager_memory", self.config
+        )
 
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
@@ -126,6 +146,7 @@ class TradingAgentsGraph:
         self.curr_state = None
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
+        self._log_lock = threading.Lock()
 
         # Set up the graph
         self.graph = self.graph_setup.setup_graph(selected_analysts)
@@ -133,6 +154,11 @@ class TradingAgentsGraph:
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
+
+        max_retries = self.config.get("max_retries")
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
+
         provider = self.config.get("llm_provider", "").lower()
 
         if provider == "google":
@@ -190,7 +216,7 @@ class TradingAgentsGraph:
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, self.risk_profile
         )
         args = self.propagator.get_graph_args()
 
@@ -218,9 +244,233 @@ class TradingAgentsGraph:
         # Return decision and processed signal
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
-    def _log_state(self, trade_date, final_state):
-        """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
+    def propose_trade(
+        self, full_signal: str, ticker: str, api_key: str, secret_key: str
+    ) -> dict:
+        """Propose a trade on Alpaca based on the analysis signal.
+
+        Returns:
+            Dict with 'reasoning' (str) and 'order_params' (dict | None).
+        """
+        return self.signal_processor.propose_trade(
+            full_signal, ticker, api_key, secret_key
+        )
+
+    @staticmethod
+    def execute_order(order_params: dict, api_key: str, secret_key: str) -> str:
+        """Execute a previously proposed order on Alpaca.
+
+        Returns:
+            Order execution result string.
+        """
+
+        return SignalProcessor.execute_order(order_params, api_key, secret_key)
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Check if an exception is a rate-limit / 429 error."""
+        msg = str(exc).lower()
+        return any(
+            hint in msg
+            for hint in ("rate limit", "rate_limit", "too many requests", "429")
+        )
+
+    def propagate_multi(
+        self, tickers: List[str], trade_date: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run the full agent graph on multiple tickers in parallel.
+
+        Uses ThreadPoolExecutor to run graph.invoke() for each ticker
+        with concurrency capped by config["max_concurrent_tickers"].
+        Rate-limited tickers are retried with exponential backoff.
+
+        Returns:
+            Dict mapping ticker -> final_state
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        max_workers = min(self.config.get("max_concurrent_tickers", 5), len(tickers))
+        max_retries = self.config.get("max_retries", 3)
+
+        def _run_single(ticker: str) -> tuple:
+            for attempt in range(max_retries):
+                try:
+                    init_state = self.propagator.create_initial_state(
+                        ticker, trade_date, self.risk_profile
+                    )
+                    args = self.propagator.get_graph_args(callbacks=self.callbacks)
+                    final_state = self.graph.invoke(init_state, **args)
+                    self._log_state(trade_date, final_state, ticker=ticker)
+                    return ticker, final_state
+                except Exception as e:
+                    if self._is_rate_limit_error(e) and attempt < max_retries - 1:
+                        wait = 10 * (attempt + 1)
+                        print(
+                            f"[{ticker}] Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait}s..."
+                        )
+                        time.sleep(wait)
+                    else:
+                        raise
+            # unreachable, but satisfies type checker
+            raise RuntimeError(f"{ticker}: retries exhausted")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_single, t): t for t in tickers}
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    t, state = future.result()
+                    with lock:
+                        results[t] = state
+                except Exception as e:
+                    print(f"Error analyzing {ticker}: {e}")
+                    with lock:
+                        results[ticker] = {"error": str(e)}
+
+        return results
+
+    def propagate_multi_streaming(
+        self,
+        tickers: List[str],
+        trade_date: str,
+        on_chunk_callback=None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run graph on multiple tickers in parallel with streaming for CLI.
+
+        Args:
+            tickers: List of ticker symbols.
+            trade_date: Trading date string.
+            on_chunk_callback: Called as on_chunk_callback(ticker, chunk)
+                for each streamed chunk. Must be thread-safe.
+
+        Returns:
+            Dict mapping ticker -> final_state
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        lock = threading.Lock()
+        max_workers = min(self.config.get("max_concurrent_tickers", 5), len(tickers))
+
+        max_retries = self.config.get("max_retries", 3)
+
+        def _stream_single(ticker: str) -> tuple:
+            for attempt in range(max_retries):
+                try:
+                    init_state = self.propagator.create_initial_state(
+                        ticker, trade_date, self.risk_profile
+                    )
+                    args = self.propagator.get_graph_args(callbacks=self.callbacks)
+                    trace = []
+                    for chunk in self.graph.stream(init_state, **args):
+                        if on_chunk_callback:
+                            on_chunk_callback(ticker, chunk)
+                        trace.append(chunk)
+                    final_state = trace[-1] if trace else {}
+                    self._log_state(trade_date, final_state, ticker=ticker)
+                    return ticker, final_state
+                except Exception as e:
+                    if self._is_rate_limit_error(e) and attempt < max_retries - 1:
+                        wait = 10 * (attempt + 1)
+                        print(
+                            f"[{ticker}] Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait}s..."
+                        )
+                        time.sleep(wait)
+                    else:
+                        raise
+            raise RuntimeError(f"{ticker}: retries exhausted")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_stream_single, t): t for t in tickers}
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    t, state = future.result()
+                    with lock:
+                        results[t] = state
+                except Exception as e:
+                    print(f"Error streaming {ticker}: {e}")
+                    with lock:
+                        results[ticker] = {"error": str(e)}
+
+        return results
+
+    def discover_and_analyze(
+        self,
+        trade_date: str,
+        api_key: str = None,
+        secret_key: str = None,
+        num_picks: int = 5,
+    ) -> Dict[str, Any]:
+        """Full pipeline: screen -> parallel research -> portfolio decisions.
+
+        Args:
+            trade_date: Trading date.
+            api_key: Alpaca API key (for fetching portfolio).
+            secret_key: Alpaca secret key.
+            num_picks: Number of stocks to discover.
+
+        Returns:
+            Dict with 'discovered_tickers', 'analysis_results', and
+            'portfolio_trades' keys.
+        """
+
+        # Get current portfolio from Alpaca
+        portfolio_tickers = []
+        if api_key and secret_key:
+            try:
+                positions = get_open_positions(api_key, secret_key)
+                portfolio_tickers = [p["symbol"] for p in positions]
+            except Exception as e:
+                print(f"Could not fetch Alpaca positions: {e}")
+
+        # Screen
+        screener = StockScreener(self.config, llm=self.quick_thinking_llm)
+        discovered = screener.screen_universe(
+            portfolio_tickers,
+            trade_date,
+            num_picks=num_picks,
+            risk_profile=self.risk_profile,
+        )
+
+        if not discovered:
+            return {
+                "discovered_tickers": [],
+                "analysis_results": {},
+                "portfolio_trades": None,
+            }
+
+        # Parallel research
+        analysis_results = self.propagate_multi(discovered, trade_date)
+
+        # Portfolio-level trade decisions
+        portfolio_trades = None
+        if api_key and secret_key:
+            ticker_signals = {
+                t: state.get("final_trade_decision", "")
+                for t, state in analysis_results.items()
+                if "error" not in state
+            }
+            if ticker_signals:
+                portfolio_trades = self.signal_processor.propose_portfolio_trades(
+                    ticker_signals, api_key, secret_key
+                )
+
+        return {
+            "discovered_tickers": discovered,
+            "analysis_results": analysis_results,
+            "portfolio_trades": portfolio_trades,
+        }
+
+    def _log_state(self, trade_date, final_state, ticker=None):
+        """Log the final state to a JSON file.
+
+        Args:
+            trade_date: The trading date.
+            final_state: The final state dict from graph execution.
+            ticker: Ticker symbol for file path. Falls back to self.ticker.
+        """
+        ticker = ticker or self.ticker
+
+        log_entry = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "market_report": final_state["market_report"],
@@ -240,8 +490,12 @@ class TradingAgentsGraph:
             },
             "trader_investment_decision": final_state["trader_investment_plan"],
             "risk_debate_state": {
-                "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
-                "conservative_history": final_state["risk_debate_state"]["conservative_history"],
+                "aggressive_history": final_state["risk_debate_state"][
+                    "aggressive_history"
+                ],
+                "conservative_history": final_state["risk_debate_state"][
+                    "conservative_history"
+                ],
                 "neutral_history": final_state["risk_debate_state"]["neutral_history"],
                 "history": final_state["risk_debate_state"]["history"],
                 "judge_decision": final_state["risk_debate_state"]["judge_decision"],
@@ -250,15 +504,15 @@ class TradingAgentsGraph:
             "final_trade_decision": final_state["final_trade_decision"],
         }
 
-        # Save to file
-        directory = Path(f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/")
-        directory.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            self.log_states_dict[str(trade_date)] = log_entry
 
-        with open(
-            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-        ) as f:
-            json.dump(self.log_states_dict, f, indent=4)
+            # Save to file (per-ticker directory)
+            if ticker:
+                directory = Path(f"eval_results/{ticker}/TradingAgentsStrategy_logs/")
+                directory.mkdir(parents=True, exist_ok=True)
+                with open(directory / f"full_states_log_{trade_date}.json", "w") as f:
+                    json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):
         """Reflect on decisions and update memory based on returns."""

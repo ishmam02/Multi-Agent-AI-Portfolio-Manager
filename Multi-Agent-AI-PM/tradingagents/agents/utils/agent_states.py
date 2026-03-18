@@ -47,9 +47,21 @@ class RiskDebateState(TypedDict):
     count: Annotated[int, "Length of the current conversation"]  # Conversation length
 
 
+class RiskProfile(TypedDict):
+    experience: Annotated[str, "Investment experience level"]
+    income: Annotated[str, "Annual income bracket"]
+    net_worth: Annotated[str, "Net worth bracket"]
+    goal: Annotated[str, "Investment goal"]
+    risk: Annotated[str, "Risk tolerance level"]
+    period: Annotated[str, "Investment time horizon"]
+
+
 class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     trade_date: Annotated[str, "What date we are trading at"]
+
+    # user risk profile
+    risk_profile: Annotated[RiskProfile, "User's investment risk profile"]
 
     sender: Annotated[str, "Agent that sent this message"]
 
@@ -73,4 +85,5 @@ class AgentState(MessagesState):
     risk_debate_state: Annotated[
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
+
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]

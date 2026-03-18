@@ -8,3 +8,12 @@ class AnalystType(str, Enum):
     SOCIAL = "social"
     NEWS = "news"
     FUNDAMENTALS = "fundamentals"
+
+
+class RiskProfile(BaseModel):
+    experience: str
+    income: str
+    net_worth: str
+    goal: str
+    risk: str
+    period: str

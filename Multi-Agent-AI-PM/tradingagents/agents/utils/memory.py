@@ -7,10 +7,14 @@ no token limits, works offline with any LLM provider.
 from rank_bm25 import BM25Okapi
 from typing import List, Tuple
 import re
+import threading
 
 
 class FinancialSituationMemory:
-    """Memory system for storing and retrieving financial situations using BM25."""
+    """Memory system for storing and retrieving financial situations using BM25.
+
+    Thread-safe: all mutations and reads are guarded by an internal lock.
+    """
 
     def __init__(self, name: str, config: dict = None):
         """Initialize the memory system.
@@ -23,6 +27,7 @@ class FinancialSituationMemory:
         self.documents: List[str] = []
         self.recommendations: List[str] = []
         self.bm25 = None
+        self._lock = threading.Lock()
 
     def _tokenize(self, text: str) -> List[str]:
         """Tokenize text for BM25 indexing.
@@ -47,12 +52,13 @@ class FinancialSituationMemory:
         Args:
             situations_and_advice: List of tuples (situation, recommendation)
         """
-        for situation, recommendation in situations_and_advice:
-            self.documents.append(situation)
-            self.recommendations.append(recommendation)
+        with self._lock:
+            for situation, recommendation in situations_and_advice:
+                self.documents.append(situation)
+                self.recommendations.append(recommendation)
 
-        # Rebuild BM25 index with new documents
-        self._rebuild_index()
+            # Rebuild BM25 index with new documents
+            self._rebuild_index()
 
     def get_memories(self, current_situation: str, n_matches: int = 1) -> List[dict]:
         """Find matching recommendations using BM25 similarity.
@@ -64,38 +70,40 @@ class FinancialSituationMemory:
         Returns:
             List of dicts with matched_situation, recommendation, and similarity_score
         """
-        if not self.documents or self.bm25 is None:
-            return []
+        with self._lock:
+            if not self.documents or self.bm25 is None:
+                return []
 
-        # Tokenize query
-        query_tokens = self._tokenize(current_situation)
+            # Tokenize query
+            query_tokens = self._tokenize(current_situation)
 
-        # Get BM25 scores for all documents
-        scores = self.bm25.get_scores(query_tokens)
+            # Get BM25 scores for all documents
+            scores = self.bm25.get_scores(query_tokens)
 
-        # Get top-n indices sorted by score (descending)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_matches]
+            # Get top-n indices sorted by score (descending)
+            top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_matches]
 
-        # Build results
-        results = []
-        max_score = max(scores) if max(scores) > 0 else 1  # Normalize scores
+            # Build results
+            results = []
+            max_score = max(scores) if max(scores) > 0 else 1  # Normalize scores
 
-        for idx in top_indices:
-            # Normalize score to 0-1 range for consistency
-            normalized_score = scores[idx] / max_score if max_score > 0 else 0
-            results.append({
-                "matched_situation": self.documents[idx],
-                "recommendation": self.recommendations[idx],
-                "similarity_score": normalized_score,
-            })
+            for idx in top_indices:
+                # Normalize score to 0-1 range for consistency
+                normalized_score = scores[idx] / max_score if max_score > 0 else 0
+                results.append({
+                    "matched_situation": self.documents[idx],
+                    "recommendation": self.recommendations[idx],
+                    "similarity_score": normalized_score,
+                })
 
-        return results
+            return results
 
     def clear(self):
         """Clear all stored memories."""
-        self.documents = []
-        self.recommendations = []
-        self.bm25 = None
+        with self._lock:
+            self.documents = []
+            self.recommendations = []
+            self.bm25 = None
 
 
 if __name__ == "__main__":

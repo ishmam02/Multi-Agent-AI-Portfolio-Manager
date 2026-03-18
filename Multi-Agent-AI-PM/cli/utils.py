@@ -2,7 +2,8 @@ import questionary
 from typing import List, Optional, Tuple, Dict
 from rich.console import Console
 
-from cli.models import AnalystType
+from cli.models import AnalystType, RiskProfile
+
 
 console = Console()
 
@@ -173,7 +174,9 @@ def select_shallow_thinking_agent(provider) -> str:
             ("Z.AI GLM 4.5 Air (free)", "z-ai/glm-4.5-air:free"),
         ],
         "ollama": [
-            ("DeepSeek-V3.2 (cloud)", "deepseek-v3.1:671b-cloud"),
+            ("Kimi-k2 (cloud)", "kimi-k2:1t-cloud"),
+            ("Kimi-k2-thinking (cloud)", "kimi-k2-thinking:cloud"),
+            ("Kimi-k2.5 (cloud)", "kimi-k2.5:cloud"),
             ("Llama3.1:8b (8B, local)", "llama3.1:8b"),
             ("Qwen2.5:7b (7B, local)", "qwen2.5:7b"),
             ("Qwen2.5:1.5b (1.5B, local)", "qwen2.5:1.5b"),
@@ -258,7 +261,9 @@ def select_deep_thinking_agent(provider) -> str:
             ),
         ],
         "ollama": [
-            ("DeepSeek-V3.2 (cloud)", "deepseek-v3.1:671b-cloud"),
+            ("Kimi-k2 (cloud)", "kimi-k2:1t-cloud"),
+            ("Kimi-k2-thinking (cloud)", "kimi-k2-thinking:cloud"),
+            ("Kimi-k2.5 (cloud)", "kimi-k2.5:cloud"),
             ("Qwen2.5:7b (7B, local)", "qwen2.5:7b"),
             ("Llama3.1:8b (8B, local)", "llama3.1:8b"),
             ("Qwen2.5:1.5b (1.5B, local)", "qwen2.5:1.5b"),
@@ -350,6 +355,185 @@ def ask_openai_reasoning_effort() -> str:
     ).ask()
 
 
+def configure_risk_profile() -> RiskProfile:
+    """Prompt the user to configure their investment risk profile."""
+    style = questionary.Style(
+        [
+            ("selected", "fg:cyan noinherit"),
+            ("highlighted", "fg:cyan noinherit"),
+            ("pointer", "fg:cyan noinherit"),
+        ]
+    )
+    instruction = "\n- Use arrow keys to navigate\n- Press Enter to select"
+
+    # Q1: Experience — inferred from actual activity, not self-label
+    experience = questionary.select(
+        "[1/6] How would you describe your investing background?",
+        choices=[
+            questionary.Choice(
+                "No experience — I have never bought a stock, fund, or any investment",
+                value="No experience",
+            ),
+            questionary.Choice(
+                "Beginner — I've made a few trades or have a basic retirement/brokerage account",
+                value="Beginner",
+            ),
+            questionary.Choice(
+                "Intermediate — I actively follow markets and manage a multi-asset portfolio",
+                value="Intermediate",
+            ),
+            questionary.Choice(
+                "Expert — Seasoned investor with experience in advanced strategies (options, leverage, etc.)",
+                value="Expert",
+            ),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if experience is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    # Q2: Income — objective replenishment capacity
+    income = questionary.select(
+        "[2/6] What is your annual household income before taxes?",
+        choices=[
+            questionary.Choice("Under $25,000", value="Under $25k"),
+            questionary.Choice("$25,000 – $49,999", value="$25k-$49k"),
+            questionary.Choice("$50,000 – $99,999", value="$50k-$99k"),
+            questionary.Choice("$100,000 – $199,999", value="$100k-$199k"),
+            questionary.Choice("$200,000 – $499,999", value="$200k-$499k"),
+            questionary.Choice("$500,000 or more", value="$500k+"),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if income is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    # Q3: Net worth — objective loss absorption capacity
+    net_worth = questionary.select(
+        "[3/6] What is your total net worth? (all assets minus all debts)",
+        choices=[
+            questionary.Choice("Under $5,000", value="Under $5k"),
+            questionary.Choice("$5,000 – $24,999", value="$5k-$24k"),
+            questionary.Choice("$25,000 – $49,999", value="$25k-$49k"),
+            questionary.Choice("$50,000 – $99,999", value="$50k-$99k"),
+            questionary.Choice("$100,000 – $249,999", value="$100k-$249k"),
+            questionary.Choice("$250,000 – $499,999", value="$250k-$499k"),
+            questionary.Choice("$500,000 – $999,999", value="$500k-$999k"),
+            questionary.Choice("$1,000,000 or more", value="$1M+"),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if net_worth is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    # Q4: Goal — what outcome the investor is optimizing for
+    goal = questionary.select(
+        "[4/6] What matters most to you about this investment?",
+        choices=[
+            questionary.Choice(
+                "Preserve Capital — protecting what I have comes before any return",
+                value="Capital Preservation",
+            ),
+            questionary.Choice(
+                "Balanced Growth — steady appreciation with limited downside exposure",
+                value="Balanced Growth",
+            ),
+            questionary.Choice(
+                "Aggressive Growth — maximize long-term returns; I accept significant volatility",
+                value="Aggressive Growth",
+            ),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if goal is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    # Q5: Risk tolerance — behavioral scenario reveals true psychological floor
+    risk = questionary.select(
+        "[5/6] Your portfolio drops 25% in a single month. What do you do?",
+        choices=[
+            questionary.Choice(
+                "Sell everything immediately — I cannot stomach any further loss",
+                value="Very Conservative",
+            ),
+            questionary.Choice(
+                "Sell most positions — locking in losses feels safer than further decline",
+                value="Conservative",
+            ),
+            questionary.Choice(
+                "Hold and wait — unsettling, but I trust a long-term recovery",
+                value="Moderate",
+            ),
+            questionary.Choice(
+                "Hold and likely buy more — dips are opportunities, not threats",
+                value="Aggressive",
+            ),
+            questionary.Choice(
+                "Aggressively buy more — large drawdowns are the best entry points",
+                value="Very Aggressive",
+            ),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if risk is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    # Q6: Investment period — defines recovery window and strategy horizon
+    period = questionary.select(
+        "[6/6] When do you expect to need or access this investment?",
+        choices=[
+            questionary.Choice(
+                "Within 1–5 years — short horizon; no time to recover from drawdowns",
+                value="1-5 years",
+            ),
+            questionary.Choice(
+                "5–10 years — medium horizon; can ride out one market cycle",
+                value="5-10 years",
+            ),
+            questionary.Choice(
+                "10–20 years — long horizon; multiple cycles available to recover",
+                value="10-20 years",
+            ),
+            questionary.Choice(
+                "20–40 years — very long; short-term swings are noise",
+                value="20-40 years",
+            ),
+            questionary.Choice(
+                "40–60 years — generational; aggressive growth is mathematically favored",
+                value="40-60 years",
+            ),
+            questionary.Choice(
+                "60+ years — ultra-long; virtually any drawdown is recoverable",
+                value="60+ years",
+            ),
+        ],
+        instruction=instruction,
+        style=style,
+    ).ask()
+    if period is None:
+        console.print("\n[red]No answer provided. Exiting...[/red]")
+        exit(1)
+
+    return RiskProfile(
+        experience=experience,
+        income=income,
+        net_worth=net_worth,
+        goal=goal,
+        risk=risk,
+        period=period,
+    )
+
+
 def ask_gemini_thinking_config() -> str | None:
     """Ask for Gemini thinking configuration.
 
@@ -370,3 +554,105 @@ def ask_gemini_thinking_config() -> str | None:
             ]
         ),
     ).ask()
+
+
+def ask_alpaca_credentials() -> tuple[str, str]:
+    """Prompt the user to enter Alpaca Paper Trading API credentials."""
+    style = questionary.Style([("text", "fg:yellow"), ("highlighted", "noinherit")])
+
+    api_key = questionary.password(
+        "Enter your Alpaca API Key:",
+        validate=lambda x: len(x.strip()) > 0 or "API key is required.",
+        style=style,
+    ).ask()
+    if api_key is None:
+        console.print("\n[red]No API key provided. Exiting...[/red]")
+        exit(1)
+
+    secret_key = questionary.password(
+        "Enter your Alpaca Secret Key:",
+        validate=lambda x: len(x.strip()) > 0 or "Secret key is required.",
+        style=style,
+    ).ask()
+    if secret_key is None:
+        console.print("\n[red]No secret key provided. Exiting...[/red]")
+        exit(1)
+
+    return api_key.strip(), secret_key.strip()
+
+
+def select_analysis_mode() -> str:
+    """Select between single stock analysis and portfolio discovery mode."""
+    choice = questionary.select(
+        "Select Analysis Mode:",
+        choices=[
+            questionary.Choice(
+                "Single Stock — Enter one ticker for deep analysis",
+                value="single",
+            ),
+            questionary.Choice(
+                "Portfolio Discovery — Screen, research multiple stocks, and get portfolio-level trades",
+                value="portfolio",
+            ),
+        ],
+        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        style=questionary.Style(
+            [
+                ("selected", "fg:cyan noinherit"),
+                ("highlighted", "fg:cyan noinherit"),
+                ("pointer", "fg:cyan noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if choice is None:
+        console.print("\n[red]No mode selected. Exiting...[/red]")
+        exit(1)
+
+    return choice
+
+
+def get_num_picks() -> int:
+    """Ask user how many stocks the screener should discover."""
+    num = questionary.text(
+        "How many stocks should the screener discover?",
+        default="5",
+        validate=lambda x: (
+            x.strip().isdigit() and 1 <= int(x.strip()) <= 20
+        ) or "Enter a number between 1 and 20.",
+        style=questionary.Style(
+            [
+                ("text", "fg:green"),
+                ("highlighted", "noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if num is None:
+        console.print("\n[red]No number provided. Exiting...[/red]")
+        exit(1)
+
+    return int(num.strip())
+
+
+def get_portfolio_tickers_manual() -> List[str]:
+    """Get portfolio tickers from manual comma-separated input."""
+    tickers_str = questionary.text(
+        "Enter current portfolio tickers (comma-separated, or press Enter for empty):",
+        default="",
+        style=questionary.Style(
+            [
+                ("text", "fg:green"),
+                ("highlighted", "noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if tickers_str is None:
+        return []
+
+    tickers_str = tickers_str.strip()
+    if not tickers_str:
+        return []
+
+    return [t.strip().upper() for t in tickers_str.split(",") if t.strip()]

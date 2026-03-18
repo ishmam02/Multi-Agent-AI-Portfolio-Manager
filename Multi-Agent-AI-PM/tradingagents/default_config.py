@@ -12,6 +12,8 @@ DEFAULT_CONFIG = {
     "deep_think_llm": "deepseek-v3.1:671b-cloud",
     "quick_think_llm": "deepseek-v3.1:671b-cloud",
     "backend_url": "https://api.openai.com/v1",
+    "max_retries": 10,
+    "rate_limit_rpm": 60,  # Max LLM requests per minute (None = unlimited)
     # Provider-specific thinking configuration
     "google_thinking_level": None,  # "high", "minimal", etc.
     "openai_reasoning_effort": None,  # "medium", "high", "low"
@@ -19,6 +21,7 @@ DEFAULT_CONFIG = {
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    "max_concurrent_tickers": 5,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {
