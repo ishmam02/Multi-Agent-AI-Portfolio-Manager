@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 
-from tradingagents.dataflows.alpaca import (
+from src.dataflows.alpaca import (
     _get_headers,
     get_account_info,
     get_open_positions,
