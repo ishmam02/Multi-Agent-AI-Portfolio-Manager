@@ -3,7 +3,6 @@ from typing import Annotated
 # Import from vendor-specific modules
 from .y_finance import (
     get_YFin_data_online,
-    get_stock_stats_indicators_window,
     get_fundamentals as get_yfinance_fundamentals,
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -13,7 +12,6 @@ from .y_finance import (
 from .yfinance_news import get_news_yfinance, get_global_news_yfinance
 from .alpha_vantage import (
     get_stock as get_alpha_vantage_stock,
-    get_indicator as get_alpha_vantage_indicator,
     get_fundamentals as get_alpha_vantage_fundamentals,
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -33,12 +31,6 @@ TOOLS_CATEGORIES = {
         "description": "OHLCV stock price data",
         "tools": [
             "get_stock_data"
-        ]
-    },
-    "technical_indicators": {
-        "description": "Technical analysis indicators",
-        "tools": [
-            "get_indicators"
         ]
     },
     "fundamental_data": {
@@ -71,11 +63,6 @@ VENDOR_METHODS = {
     "get_stock_data": {
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
-    },
-    # technical_indicators
-    "get_indicators": {
-        "alpha_vantage": get_alpha_vantage_indicator,
-        "yfinance": get_stock_stats_indicators_window,
     },
     # fundamental_data
     "get_fundamentals": {

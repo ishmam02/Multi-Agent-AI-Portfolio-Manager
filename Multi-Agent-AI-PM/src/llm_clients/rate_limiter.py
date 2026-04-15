@@ -16,5 +16,5 @@ def create_rate_limiter(rpm: int) -> InMemoryRateLimiter:
     return InMemoryRateLimiter(
         requests_per_second=rpm / 60.0,
         check_every_n_seconds=0.1,
-        max_bucket_size=5,
+        max_bucket_size=3,
     )

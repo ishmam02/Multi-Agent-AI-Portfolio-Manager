@@ -4,12 +4,9 @@ import os
 from pathlib import Path
 import json
 import time
-from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-
-from langgraph.prebuilt import ToolNode
 
 from src.llm_clients import create_llm_client
 from src.llm_clients.rate_limiter import create_rate_limiter
@@ -17,27 +14,10 @@ from src.llm_clients.rate_limiter import create_rate_limiter
 from src.agents import *
 from src.default_config import DEFAULT_CONFIG
 from src.agents.utils.memory import FinancialSituationMemory
-from src.agents.utils.agent_states import (
-    AgentState,
-)
+from src.agents.utils.agent_states import AgentState
+from src.agents.code_agent.code_agent import CodeValidationAgent
 from src.dataflows.config import set_config
-from src.graph.signal_processing import SignalProcessor
 
-
-# Import the new abstract tool methods from agent_utils
-from src.agents.utils.agent_utils import (
-    get_stock_data,
-    get_indicators,
-    get_fundamentals,
-    get_balance_sheet,
-    get_cashflow,
-    get_income_statement,
-    get_news,
-    get_insider_transactions,
-    get_global_news,
-)
-
-from .conditional_logic import ConditionalLogic
 from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
@@ -108,20 +88,35 @@ class TradingAgentsGraph:
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
 
+        # Initialize Code Agents (Phase 2 — one per analyst type)
+        # Maps analyst key -> CodeValidationAgent type string
+        _analyst_type_map = {
+            "market": "technical",
+            "social": "sentiment",
+            "news": "macro",
+            "fundamentals": "fundamental",
+        }
+        self.code_agents = {}
+        for analyst_key in selected_analysts:
+            ca_type = _analyst_type_map.get(analyst_key, "fundamental")
+            self.code_agents[analyst_key] = CodeValidationAgent(
+                model=self.config.get("code_agent_model", "kimi-k2.5:cloud"),
+                base_url=self.config.get("code_agent_base_url", "http://localhost:11434"),
+                timeout=self.config.get("code_agent_timeout", 60),
+                max_iterations=self.config.get("code_agent_max_iterations", 5),
+                analyst_type=ca_type,
+            )
+
         # Initialize memories
         self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
 
-        # Create tool nodes
-        self.tool_nodes = self._create_tool_nodes()
-
-        # Initialize components
-        self.conditional_logic = ConditionalLogic()
+        # Initialize components (no tool nodes or conditional logic needed)
         self.graph_setup = GraphSetup(
-            self.quick_thinking_llm,
-            self.deep_thinking_llm,
-            self.tool_nodes,
-            self.trader_memory,
-            self.conditional_logic,
+            reasoning_llm=self.deep_thinking_llm,
+            code_agents=self.code_agents,
+            trader_memory=self.trader_memory,
+            quick_thinking_llm=self.quick_thinking_llm,
+            research_depth=self.config.get("research_depth", "medium"),
         )
 
         self.propagator = Propagator()
@@ -158,42 +153,6 @@ class TradingAgentsGraph:
                 kwargs["reasoning_effort"] = reasoning_effort
 
         return kwargs
-
-    def _create_tool_nodes(self) -> Dict[str, ToolNode]:
-        """Create tool nodes for different data sources using abstract methods."""
-        return {
-            "market": ToolNode(
-                [
-                    # Core stock data tools
-                    get_stock_data,
-                    # Technical indicators
-                    get_indicators,
-                ]
-            ),
-            "social": ToolNode(
-                [
-                    # News tools for social media analysis
-                    get_news,
-                ]
-            ),
-            "news": ToolNode(
-                [
-                    # News and insider information
-                    get_news,
-                    get_global_news,
-                    get_insider_transactions,
-                ]
-            ),
-            "fundamentals": ToolNode(
-                [
-                    # Fundamental analysis tools
-                    get_fundamentals,
-                    get_balance_sheet,
-                    get_cashflow,
-                    get_income_statement,
-                ]
-            ),
-        }
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""

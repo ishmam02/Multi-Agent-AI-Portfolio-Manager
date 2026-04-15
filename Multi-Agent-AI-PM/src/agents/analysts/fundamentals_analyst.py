@@ -1,69 +1,113 @@
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-import time
-import json
-from src.agents.utils.agent_utils import (
-    get_fundamentals,
-    get_balance_sheet,
-    get_cashflow,
-    get_income_statement,
-    get_insider_transactions,
+"""
+Fundamentals Analyst — Phase 1/3 prompts, data gathering, and node factory.
+
+Uses the base_analyst 3-phase subgraph to:
+  1. Deterministically gather financial statements & fundamentals
+  2. LLM plans which valuation metrics to compute
+  3. Code agent computes them
+  4. LLM interprets results and forms an investment thesis
+"""
+
+from src.agents.utils.schemas import AgentType
+from src.agents.analysts.base_analyst import (
+    create_analyst_node,
 )
-from src.dataflows.config import get_config
+
+# ── Horizon-specific focus instructions ─────────────────────────────────────
+
+HORIZON_FOCUS = {
+    "long_term": (
+        "HORIZON: Long-term (1+ years). "
+        "Focus on intrinsic valuation (DCF, residual income), durable competitive "
+        "advantages, secular revenue growth, capital allocation track record, "
+        "and balance-sheet resilience over multiple business cycles."
+    ),
+    "medium_term": (
+        "HORIZON: Medium-term (3-12 months). "
+        "Focus on upcoming earnings catalysts, margin trajectory, guidance "
+        "revisions, peer-relative valuation multiples (P/E, EV/EBITDA), and "
+        "near-term capital structure changes."
+    ),
+    "short_term": (
+        "HORIZON: Short-term (days to weeks). "
+        "Focus on earnings-surprise risk, short-term free-cash-flow dynamics, "
+        "imminent catalyst events (ex-dividend, lock-up expiry, index rebalance), "
+        "and any anomalous insider activity."
+    ),
+}
+
+# ── Phase 1 system prompt (plan — decide WHAT to compute) ───────────────────
+
+PHASE1_PROMPT = (
+    "You are a senior equity research analyst. Review the financial data, "
+    "SEC filings, and earnings transcripts. Determine which valuation models, "
+    "ratio analyses, and scoring frameworks should be computed to properly "
+    "evaluate this company. Do NOT form a thesis yet — only plan the "
+    "quantitative work."
+)
+
+# ── Phase 3 system prompt (thesis — interpret results) ──────────────────────
+
+PHASE3_PROMPT = (
+    "You are a senior equity research analyst. You have received computed "
+    "valuation metrics, financial ratios, and scoring results. Interpret "
+    "these numbers in context. Form an investment thesis on intrinsic value "
+    "vs. market price. Cite specific computed metrics to support each claim."
+)
 
 
-def create_fundamentals_analyst(llm):
-    def fundamentals_analyst_node(state):
-        current_date = state["trade_date"]
-        ticker = state["company_of_interest"]
-        company_name = state["company_of_interest"]
+# ── Data gathering (deterministic, no LLM) ──────────────────────────────────
 
-        tools = [
-            get_fundamentals,
-            get_balance_sheet,
-            get_cashflow,
-            get_income_statement,
-        ]
 
-        system_message = (
-            "You are a researcher tasked with analyzing fundamental information over the past week about a company. Please write a comprehensive report of the company's fundamental information such as financial documents, company profile, basic company financials, and company financial history to gain a full view of the company's fundamental information to inform traders. Make sure to include as much detail as possible. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions."
-            + " Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."
-            + " Use the available tools: `get_fundamentals` for comprehensive company analysis, `get_balance_sheet`, `get_cashflow`, and `get_income_statement` for specific financial statements.",
-        )
+def gather_fundamental_data(ticker: str, trade_date: str, lookback_days: int) -> dict:
+    """Fetch financial statements and fundamentals for the given ticker."""
+    from src.agents.utils.agent_utils import (
+        get_balance_sheet,
+        get_cashflow,
+        get_fundamentals,
+        get_income_statement,
+    )
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You are a helpful AI assistant, collaborating with other assistants."
-                    " Use the provided tools to progress towards answering the question."
-                    " If you are unable to fully answer, that's OK; another assistant with different tools"
-                    " will help where you left off. Execute what you can to make progress."
-                    " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
-                    " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
-                    " You have access to the following tools: {tool_names}.\n{system_message}"
-                    "For your reference, the current date is {current_date}. The company we want to look at is {ticker}",
-                ),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
-        )
+    data = {}
+    data["fundamentals"] = get_fundamentals.invoke(
+        {"ticker": ticker, "curr_date": trade_date}
+    )
+    data["balance_sheet_quarterly"] = get_balance_sheet.invoke(
+        {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}
+    )
+    data["balance_sheet_annual"] = get_balance_sheet.invoke(
+        {"ticker": ticker, "freq": "annual", "curr_date": trade_date}
+    )
+    data["cashflow"] = get_cashflow.invoke(
+        {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}
+    )
+    data["income_statement"] = get_income_statement.invoke(
+        {"ticker": ticker, "freq": "quarterly", "curr_date": trade_date}
+    )
+    return data
 
-        prompt = prompt.partial(system_message=system_message)
-        prompt = prompt.partial(tool_names=", ".join([tool.name for tool in tools]))
-        prompt = prompt.partial(current_date=current_date)
-        prompt = prompt.partial(ticker=ticker)
 
-        chain = prompt | llm.bind_tools(tools)
+# ── Node factory ─────────────────────────────────────────────────────────────
 
-        result = chain.invoke(state["messages"])
 
-        report = ""
+def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="medium"):
+    """Create a fundamentals analyst node for the outer AgentState graph.
 
-        if len(result.tool_calls) == 0:
-            report = result.content
+    Parameters
+    ----------
+    reasoning_llm  : LangChain chat model for Phase 1 (plan) and Phase 3 (thesis)
+    code_agent     : CodeValidationAgent instance for Phase 2 (compute)
+    research_depth : "shallow" | "medium" | "deep"
+    """
+    analyst_config = {
+        "agent_type": AgentType.FUNDAMENTAL,
+        "state_key": "fundamentals_report",
+        "gather_fn": gather_fundamental_data,
+        "phase1_system_prompt": PHASE1_PROMPT,
+        "phase3_system_prompt": PHASE3_PROMPT,
+        "horizon_focus": HORIZON_FOCUS,
+    }
 
-        return {
-            "messages": [result],
-            "fundamentals_report": report,
-        }
-
-    return fundamentals_analyst_node
+    return create_analyst_node(
+        reasoning_llm, code_agent, analyst_config, research_depth,
+    )
