@@ -8,7 +8,7 @@ Uses the base_analyst 3-phase subgraph to:
   4. LLM interprets results and forms a thesis on price direction
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.agents.code_agent.code_agent import CodeValidationAgent
 from src.agents.utils.schemas import AgentType, ResearchReport
@@ -971,14 +971,14 @@ if __name__ == "__main__":
     import statistics
 
     # Simple local run settings (plain text, no CLI args).
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     # market_analyst.py lives at src/agents/analysts/ — 3 levels up = Multi-Agent-AI-PM/
     _project_root = str(pathlib.Path(__file__).resolve().parents[3])
 
     ticker = "AAPL"
     trade_date = today_str
     research_depth = "shallow"
-    num_runs = 1  # number of repeated runs
+    num_runs = 3  # number of repeated runs
 
     llm_provider = "ollama"
     llm_model = "minimax-m2.7:cloud"
@@ -1021,7 +1021,7 @@ if __name__ == "__main__":
     }
 
     # ── Collect mu, sigma, and conviction from each run ──────────────────────
-    horizons = ["long_term", "medium_term", "short_term"]
+    horizons = ["short_term"]
     mu_runs: dict[str, list[float]] = {h: [] for h in horizons}
     sigma_runs: dict[str, list[float]] = {h: [] for h in horizons}
     conviction_runs: dict[str, list[float]] = {h: [] for h in horizons}
