@@ -45,23 +45,33 @@ class SignalProcessor:
 
     def process_signal(self, full_signal: str) -> str:
         """
-        Process a full trading signal to extract the core decision.
+        Process a composite signal JSON to extract the core decision.
 
         Args:
-            full_signal: Complete trading signal text
+            full_signal: JSON-serialized CompositeSignal string
 
         Returns:
             Extracted decision (BUY, SELL, or HOLD)
         """
-        messages = [
-            (
-                "system",
-                "You are an efficient assistant designed to analyze paragraphs or financial reports provided by a group of analysts. Your task is to extract the investment decision: BUY, SELL, SHORT_SELL, or HOLD. Use SHORT_SELL when the analysis recommends opening a short position (not just selling an existing long). Provide only the extracted decision as your output, without adding any additional text or information.",
-            ),
-            ("human", full_signal),
-        ]
-
-        return self.quick_thinking_llm.invoke(messages).content
+        try:
+            from src.agents.utils.schemas import CompositeSignal
+            cs = CompositeSignal.model_validate_json(full_signal)
+            if cs.mu_final > 0.05:
+                return "BUY"
+            elif cs.mu_final < -0.05:
+                return "SELL"
+            else:
+                return "HOLD"
+        except Exception:
+            # Fallback: ask the LLM to parse the raw text
+            messages = [
+                (
+                    "system",
+                    "You are an efficient assistant designed to analyze paragraphs or financial reports provided by a group of analysts. Your task is to extract the investment decision: BUY, SELL, SHORT_SELL, or HOLD. Use SHORT_SELL when the analysis recommends opening a short position (not just selling an existing long). Provide only the extracted decision as your output, without adding any additional text or information.",
+                ),
+                ("human", full_signal),
+            ]
+            return self.quick_thinking_llm.invoke(messages).content
 
     def propose_trade(
         self, full_signal: str, ticker: str, api_key: str, secret_key: str
@@ -177,11 +187,11 @@ class SignalProcessor:
     ) -> Dict[str, Any]:
         """Portfolio Manager: evaluate ALL stock decisions holistically.
 
-        Receives every ticker's trader_investment_plan at once and produces
+        Receives every ticker's composite_signal JSON at once and produces
         portfolio-level allocation with fact-based reasoning per stock.
 
         Args:
-            ticker_signals: {ticker: trader_investment_plan_text}
+            ticker_signals: {ticker: composite_signal_json}
             api_key: Alpaca API key
             secret_key: Alpaca secret key
 

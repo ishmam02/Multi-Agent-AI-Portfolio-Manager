@@ -66,7 +66,7 @@ class MessageBuffer:
         "sentiment_report": ("social", "Social Analyst"),
         "news_report": ("news", "News Analyst"),
         "fundamentals_report": ("fundamentals", "Fundamentals Analyst"),
-        "trader_investment_plan": (None, "Trader"),
+        "composite_signal": (None, "Synthesis Agent"),
     }
 
     def __init__(self, max_length=100):
@@ -172,7 +172,7 @@ class MessageBuffer:
                 "sentiment_report": "Social Sentiment",
                 "news_report": "News Analysis",
                 "fundamentals_report": "Fundamentals Analysis",
-                "trader_investment_plan": "Trading Team Plan",
+                "composite_signal": "Synthesis Signal",
             }
             self.current_report = (
                 f"### {section_titles[latest_section]}\n{latest_content}"
@@ -211,9 +211,9 @@ class MessageBuffer:
                 )
 
         # Trading Team Reports
-        if self.report_sections.get("trader_investment_plan"):
+        if self.report_sections.get("composite_signal"):
             report_parts.append("## Trading Team Plan")
-            report_parts.append(f"{self.report_sections['trader_investment_plan']}")
+            report_parts.append(f"{self.report_sections['composite_signal']}")
 
         self.final_report = "\n\n".join(report_parts) if report_parts else None
 
@@ -665,12 +665,17 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         sections.append(f"## I. Analyst Team Reports\n\n{content}")
 
     # 3. Trading
-    if final_state.get("trader_investment_plan"):
+    if final_state.get("composite_signal"):
         trading_dir = save_path / "3_trading"
         trading_dir.mkdir(exist_ok=True)
-        (trading_dir / "trader.md").write_text(final_state["trader_investment_plan"])
+        try:
+            parsed = json.loads(final_state["composite_signal"])
+            composite_pretty = json.dumps(parsed, indent=2)
+        except Exception:
+            composite_pretty = final_state["composite_signal"]
+        (trading_dir / "synthesis.md").write_text(composite_pretty)
         sections.append(
-            f"## III. Trading Team Plan\n\n### Trader\n{final_state['trader_investment_plan']}"
+            f"## III. Synthesis Signal\n\n### Synthesis Agent\n```json\n{composite_pretty}\n```"
         )
 
     # Write consolidated report
@@ -705,15 +710,20 @@ def display_complete_report(final_state):
                 )
             )
 
-    # III. Trading Team
-    if final_state.get("trader_investment_plan"):
+    # III. Synthesis Signal
+    if final_state.get("composite_signal"):
         console.print(
-            Panel("[bold]III. Trading Team Plan[/bold]", border_style="yellow")
+            Panel("[bold]III. Synthesis Signal[/bold]", border_style="yellow")
         )
+        try:
+            parsed = json.loads(final_state["composite_signal"])
+            composite_pretty = json.dumps(parsed, indent=2)
+        except Exception:
+            composite_pretty = final_state["composite_signal"]
         console.print(
             Panel(
-                Markdown(final_state["trader_investment_plan"]),
-                title="Trader",
+                Markdown(f"```json\n{composite_pretty}\n```"),
+                title="Synthesis Agent",
                 border_style="blue",
                 padding=(1, 2),
             )
@@ -721,10 +731,9 @@ def display_complete_report(final_state):
 
 
 # Ordered list of analysts for status transitions
-ANALYST_ORDER = ["market", "social", "news", "fundamentals"]
+ANALYST_ORDER = ["market", "news", "fundamentals"]
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
-    "social": "Social Analyst",
     "news": "News Analyst",
     "fundamentals": "Fundamentals Analyst",
 }
@@ -1036,9 +1045,9 @@ def run_analysis():
             update_analyst_statuses(message_buffer, chunk)
 
             # Trading Team
-            if chunk.get("trader_investment_plan"):
+            if chunk.get("composite_signal"):
                 message_buffer.update_report_section(
-                    "trader_investment_plan", chunk["trader_investment_plan"]
+                    "composite_signal", chunk["composite_signal"]
                 )
                 if message_buffer.agent_status.get("Trader") != "completed":
                     message_buffer.update_agent_status("Trader", "completed")
@@ -1050,7 +1059,7 @@ def run_analysis():
 
         # Get final state and decision
         final_state = trace[-1]
-        decision = graph.process_signal(final_state["trader_investment_plan"])
+        decision = graph.process_signal(final_state["composite_signal"])
 
         # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
@@ -1108,7 +1117,7 @@ def run_analysis():
         console.print("\n[cyan]Generating trade proposal...[/cyan]")
         try:
             proposal = graph.propose_trade(
-                final_state["trader_investment_plan"],
+                final_state["composite_signal"],
                 selections["ticker"],
                 selections["alpaca_api_key"],
                 selections["alpaca_secret_key"],
@@ -1511,9 +1520,9 @@ def run_multi_analysis(selections):
         update_analyst_statuses(buf, chunk)
 
         # Trader — status + report section
-        if chunk.get("trader_investment_plan"):
+        if chunk.get("composite_signal"):
             buf.update_report_section(
-                "trader_investment_plan", chunk["trader_investment_plan"]
+                "composite_signal", chunk["composite_signal"]
             )
             if buf.agent_status.get("Trader") != "completed":
                 buf.update_agent_status("Trader", "completed")
@@ -1568,7 +1577,7 @@ def run_multi_analysis(selections):
         if "error" in state:
             summary_table.add_row(t, "[red]ERROR[/red]", str(state["error"])[:50])
         else:
-            signal = state.get("trader_investment_plan", "")
+            signal = state.get("composite_signal", "")
             decision = graph.process_signal(signal) if signal else "N/A"
             color = {"BUY": "green", "SELL": "red", "HOLD": "yellow"}.get(
                 decision, "white"

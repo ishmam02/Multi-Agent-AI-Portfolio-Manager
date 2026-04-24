@@ -163,6 +163,50 @@ def get_income_statement(
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
 
+def get_earnings_dates(
+    ticker: Annotated[str, "ticker symbol of the company"]
+):
+    """Get earnings dates with actual and estimated EPS from yfinance."""
+    try:
+        ticker_obj = yf.Ticker(ticker.upper())
+        data = ticker_obj.earnings_dates
+
+        if data is None or data.empty:
+            return f"No earnings dates data found for symbol '{ticker}'"
+
+        return data.to_csv()
+
+    except Exception as e:
+        return f"Error retrieving earnings dates for {ticker}: {str(e)}"
+
+
+def get_quarterly_history(
+    ticker: Annotated[str, "ticker symbol of the company"]
+):
+    """Get quarterly price history (OHLCV) from yfinance, all available data."""
+    try:
+        ticker_obj = yf.Ticker(ticker.upper())
+        data = ticker_obj.history(period="max", interval="3mo")
+
+        if data.empty:
+            return f"No quarterly history data found for symbol '{ticker}'"
+
+        # Remove timezone info from index for cleaner output
+        if data.index.tz is not None:
+            data.index = data.index.tz_localize(None)
+
+        # Round numerical values to 2 decimal places for cleaner display
+        numeric_columns = ["Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits"]
+        for col in numeric_columns:
+            if col in data.columns:
+                data[col] = data[col].round(2)
+
+        return data.to_csv()
+
+    except Exception as e:
+        return f"Error retrieving quarterly history for {ticker}: {str(e)}"
+
+
 def get_insider_transactions(
     ticker: Annotated[str, "ticker symbol of the company"]
 ):
@@ -280,3 +324,26 @@ def get_industry_top_companies(
 
     except Exception as e:
         return f"Error getting industry companies for {industry_key}: {str(e)}"
+
+def get_analyst_recommendations(symbol: Annotated[str, "ticker symbol of the company"]):
+    """Get analyst recommendations for a ticker from yfinance."""
+    try:
+        ticker = yf.Ticker(symbol.upper())
+        recs = ticker.recommendations
+        if recs is None or recs.empty:
+            return f"No analyst recommendations found for {symbol}"
+        return recs.reset_index().to_dict(orient="records")
+    except Exception as e:
+        return f"Error getting analyst recommendations for {symbol}: {str(e)}"
+
+
+def get_growth_estimates(symbol: Annotated[str, "ticker symbol of the company"]):
+    """Get growth estimates for a ticker from yfinance."""
+    try:
+        ticker = yf.Ticker(symbol.upper())
+        growth = ticker.growth_estimates
+        if growth is None or growth.empty:
+            return f"No growth estimates found for {symbol}"
+        return growth.reset_index().to_dict(orient="records")
+    except Exception as e:
+        return f"Error getting growth estimates for {symbol}: {str(e)}"

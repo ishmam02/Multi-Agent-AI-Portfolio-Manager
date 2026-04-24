@@ -26,7 +26,7 @@ class Propagator:
             "sentiment_report": "",
             "news_report": "",
             "pm_prompt": "",
-            "trader_investment_plan": "",
+            "composite_signal": "",
         }
         if risk_profile is not None:
             state["risk_profile"] = risk_profile

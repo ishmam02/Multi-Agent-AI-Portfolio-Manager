@@ -1,5 +1,6 @@
 # TradingAgents/graph/setup.py
 
+import time
 from typing import Dict, Any
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
@@ -32,8 +33,8 @@ class GraphSetup:
         reasoning_llm      : LLM for Phase 1 (plan) and Phase 3 (thesis)
         code_agents        : Dict mapping analyst key -> CodeValidationAgent
                              e.g. {"market": CodeValidationAgent(..., analyst_type="technical")}
-        trader_memory      : FinancialSituationMemory for the trader
-        quick_thinking_llm : LLM for the trader node (falls back to reasoning_llm)
+        trader_memory      : FinancialSituationMemory for the synthesis agent
+        quick_thinking_llm : LLM for the synthesis node (falls back to reasoning_llm)
         research_depth     : "shallow" | "medium" | "deep"
         """
         self.reasoning_llm = reasoning_llm
@@ -43,14 +44,13 @@ class GraphSetup:
         self.research_depth = research_depth
 
     def setup_graph(
-        self, selected_analysts=["market", "social", "news", "fundamentals"]
+        self, selected_analysts=["market", "news", "fundamentals"]
     ):
         """Set up and compile the agent workflow graph.
 
         Args:
             selected_analysts (list): List of analyst types to include. Options are:
                 - "market": Market/technical analyst
-                - "social": Social media/sentiment analyst
                 - "news": News/macro analyst
                 - "fundamentals": Fundamentals analyst
         """
@@ -65,11 +65,6 @@ class GraphSetup:
                 self.reasoning_llm, self.code_agents["market"], self.research_depth,
             )
 
-        if "social" in selected_analysts:
-            analyst_nodes["social"] = create_social_media_analyst(
-                self.reasoning_llm, self.code_agents["social"], self.research_depth,
-            )
-
         if "news" in selected_analysts:
             analyst_nodes["news"] = create_news_analyst(
                 self.reasoning_llm, self.code_agents["news"], self.research_depth,
@@ -80,12 +75,19 @@ class GraphSetup:
                 self.reasoning_llm, self.code_agents["fundamentals"], self.research_depth,
             )
 
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        # Synthesis Agent — uses the fundamentals code_agent as generic math executor
+        synthesis_code_agent = self.code_agents.get(
+            "fundamentals", list(self.code_agents.values())[0]
+        )
+        synthesis_node = create_synthesis_agent(
+            self.reasoning_llm,
+            synthesis_code_agent,
+            self.trader_memory,
+        )
 
         # Map each analyst type to its report field in AgentState
         report_keys_map = {
             "market": "market_report",
-            "social": "sentiment_report",
             "news": "news_report",
             "fundamentals": "fundamentals_report",
         }
@@ -97,22 +99,22 @@ class GraphSetup:
         def analyst_sync(state):
             return {}
 
-        # Only proceed to Trader once every selected analyst has written its report
-        def should_proceed_to_trader(state):
+        # Only proceed to Synthesis once every selected analyst has written its report
+        def should_proceed_to_synthesis(state):
             if all(state.get(k) for k in required_reports):
-                return "Trader"
+                return "Synthesis Agent"
             return END
 
         # Build the workflow graph
         workflow = StateGraph(AgentState)
 
-        # Add analyst nodes
+        # Add analyst nodes with exception handling and retry logic
         for analyst_type, node in analyst_nodes.items():
             workflow.add_node(f"{analyst_type.capitalize()} Analyst", node)
 
-        # Barrier + trader
+        # Barrier + synthesis
         workflow.add_node("Analyst Sync", analyst_sync)
-        workflow.add_node("Trader", trader_node)
+        workflow.add_node("Synthesis Agent", synthesis_node)
 
         # Fan-out: all analysts start in parallel from START
         for analyst_type in analyst_nodes:
@@ -124,11 +126,11 @@ class GraphSetup:
                 f"{analyst_type.capitalize()} Analyst", "Analyst Sync"
             )
 
-        # Barrier routes to Trader when all reports are present
+        # Barrier routes to Synthesis when all reports are present
         workflow.add_conditional_edges(
-            "Analyst Sync", should_proceed_to_trader, ["Trader", END]
+            "Analyst Sync", should_proceed_to_synthesis, ["Synthesis Agent", END]
         )
 
-        workflow.add_edge("Trader", END)
+        workflow.add_edge("Synthesis Agent", END)
 
         return workflow.compile()

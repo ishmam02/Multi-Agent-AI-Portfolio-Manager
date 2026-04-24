@@ -1,100 +1,416 @@
+"""
+Synthesis Agent — structured composite signal generation.
+
+Replaces the free-text Trader node with a 3-phase deterministic + LLM-assisted
+synthesis that consumes analyst ResearchReport outputs and emits a
+CompositeSignal.
+"""
+
+from __future__ import annotations
+
 import functools
-import time
 import json
+import math
+import os
+import re
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from src.agents.utils.schemas import (
+    AgentType,
+    AnalystWeights,
+    CompositeSignal,
+    CrossSignalConflict,
+    HorizonValues,
+    HorizonWeights,
+    ResearchReport,
+)
 
 
-def create_trader(llm, memory):
-    def trader_node(state, name):
+# ── Constants ────────────────────────────────────────────────────────────────
+
+AGENT_TYPE_MAP = {
+    "market_report": AgentType.TECHNICAL,
+    "sentiment_report": AgentType.SENTIMENT,
+    "news_report": AgentType.NEWS,
+    "fundamentals_report": AgentType.FUNDAMENTAL,
+}
+
+AGENT_TYPE_KEYS = {
+    AgentType.FUNDAMENTAL: "fundamental",
+    AgentType.TECHNICAL: "technical",
+    AgentType.NEWS: "macro",
+    AgentType.SENTIMENT: "sentiment",
+}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _extract_json_block(text: str) -> dict:
+    """Extract the first JSON object or array from text."""
+    stripped = text.strip()
+    # Direct parse
+    if stripped.startswith(("{", "[")):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+    # Fenced code blocks
+    for m in re.finditer(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL):
+        try:
+            return json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Forward scan for { or [
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"[\{\[]", text):
+        try:
+            d, _ = decoder.raw_decode(text, m.start())
+            if isinstance(d, (dict, list)):
+                return d
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return {}
+
+
+def _normalize_weights(weights: dict) -> dict:
+    """Normalize per-horizon analyst weights to sum to 1.0 (±1e-6)."""
+    normalized = {}
+    for horizon, w in weights.items():
+        if not isinstance(w, dict):
+            w = {}
+        vals = {
+            "fundamental": float(w.get("fundamental", 0.0)),
+            "technical": float(w.get("technical", 0.0)),
+            "macro": float(w.get("macro", 0.0)),
+            "sentiment": float(w.get("sentiment", 0.0)),
+        }
+        total = sum(vals.values())
+        if total > 0:
+            vals = {k: v / total for k, v in vals.items()}
+        else:
+            vals = {k: 0.25 for k in vals}
+        normalized[horizon] = vals
+    return normalized
+
+
+def _default_equal_weights() -> dict:
+    """Return equal weights for all analysts across all horizons."""
+    return {
+        "long_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
+        "medium_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
+        "short_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
+    }
+
+
+# ── Synthesis Agent Factory ──────────────────────────────────────────────────
+
+
+def create_synthesis_agent(llm, code_agent, memory):
+    """Create a synthesis node function for the outer AgentState graph.
+
+    Parameters
+    ----------
+    llm        : LangChain chat model for Phase 1 (weights) and Phase 2 (conflicts)
+    code_agent : CodeValidationAgent for Phase 3 math (or None to compute inline)
+    memory     : FinancialSituationMemory for contextual weighting
+    """
+
+    def synthesis_node(state, name):
         company_name = state["company_of_interest"]
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
+        trade_date = state.get("trade_date", datetime.now().strftime("%Y-%m-%d"))
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
+        # ── Step A: Deserialize reports ─────────────────────────────────────
+        reports: Dict[AgentType, ResearchReport] = {}
+        for key, agent_type in AGENT_TYPE_MAP.items():
+            raw = state.get(key, "")
+            if raw:
+                try:
+                    reports[agent_type] = ResearchReport.model_validate_json(raw)
+                except Exception:
+                    pass
+
+        if not reports:
+            # No reports available — emit a neutral signal
+            composite = CompositeSignal(
+                ticker=company_name,
+                timestamp=datetime.now(),
+                mu_composite=HorizonValues(long_term=0.0, medium_term=0.0, short_term=0.0),
+                sigma_composite=HorizonValues(long_term=0.01, medium_term=0.01, short_term=0.01),
+                mu_final=0.0,
+                sigma_final=0.01,
+                conviction_final=0.0,
+                analyst_weights=HorizonWeights(),
+                horizon_blend_weights=HorizonValues(long_term=0.33, medium_term=0.33, short_term=0.34),
+                weighting_rationale="No analyst reports available; defaulting to neutral signal.",
+                cross_signal_conflicts=[],
+                unresolved_penalty=0.0,
+                source_reports=[],
+                computation_provenance="default_fallback",
+            )
+            return {
+                "messages": [HumanMessage(content="No reports available — neutral signal.")],
+                "composite_signal": composite.model_dump_json(),
+                "sender": name,
+            }
+
+        # ── Step B: Build situation string for memory ─────────────────────────
+        situation_parts = []
+        for agent_type, report in reports.items():
+            thesis = report.investment_thesis
+            situation_parts.append(
+                f"{agent_type.value.upper()} THESIS:\n"
+                f"  Long: {thesis.long_term}\n"
+                f"  Medium: {thesis.medium_term}\n"
+                f"  Short: {thesis.short_term}"
+            )
+            if report.key_catalysts:
+                cats = "\n  ".join([c.catalyst for c in report.key_catalysts[:3]])
+                situation_parts.append(f"  Catalysts: {cats}")
+            if report.key_risks:
+                risks = "\n  ".join([r.risk for r in report.key_risks[:3]])
+                situation_parts.append(f"  Risks: {risks}")
+        curr_situation = "\n\n".join(situation_parts)
         past_memories = memory.get_memories(curr_situation, n_matches=2)
 
         past_memory_str = ""
         if past_memories:
             for i, rec in enumerate(past_memories, 1):
-                past_memory_str += rec["recommendation"] + "\n\n"
+                past_memory_str += f"Memory {i}: {rec['recommendation']}\n"
 
-        past_reflections_section = f"""
+        # ── Phase 1: Dynamic Weight Assignment (LLM) ────────────────────────
+        reports_json = []
+        for agent_type, report in reports.items():
+            reports_json.append(
+                {
+                    "analyst": agent_type.value,
+                    "mu": {
+                        "long_term": report.mu.long_term,
+                        "medium_term": report.mu.medium_term,
+                        "short_term": report.mu.short_term,
+                    },
+                    "sigma": {
+                        "long_term": report.sigma_contribution.long_term,
+                        "medium_term": report.sigma_contribution.medium_term,
+                        "short_term": report.sigma_contribution.short_term,
+                    },
+                    "conviction": {
+                        "long_term": report.conviction.long_term,
+                        "medium_term": report.conviction.medium_term,
+                        "short_term": report.conviction.short_term,
+                    },
+                    "thesis": {
+                        "long_term": report.investment_thesis.long_term,
+                        "medium_term": report.investment_thesis.medium_term,
+                        "short_term": report.investment_thesis.short_term,
+                    },
+                }
+            )
 
-PAST TRADE REFLECTIONS:
-The following are lessons from similar situations you have traded in before. Use these to avoid repeating mistakes and to refine your current proposal:
-{past_memory_str}""" if past_memory_str.strip() else ""
+        phase1_prompt = f"""You are a senior portfolio manager synthesizing multi-analyst research into a unified signal.
 
-        context = {
-            "role": "user",
-            "content": f"""The research team has completed their analysis of {company_name}. Below are the consolidated reports. Use these as the foundation for your trade proposal.
+Your task is to assign per-analyst, per-horizon weights that sum to 1.0 for each horizon.
 
-MARKET RESEARCH REPORT:
-{market_research_report}
+Available analysts and their signals:
+{json.dumps(reports_json, indent=2)}
 
-SOCIAL MEDIA SENTIMENT REPORT:
-{sentiment_report}
+Past context:
+{past_memory_str or "(none)"}
 
-LATEST NEWS REPORT:
-{news_report}
+Instructions:
+1. Assign weights for each horizon (long_term, medium_term, short_term).
+2. Each horizon's weights must sum to exactly 1.0.
+3. Provide a concise rationale (2-3 sentences) explaining your weighting logic.
+4. If an analyst type is missing, assign it weight 0.0 and redistribute.
+5. Also provide horizon_blend_weights (how much to weight long/medium/short when blending into a single final signal). These three must also sum to 1.0.
 
-COMPANY FUNDAMENTALS REPORT:
-{fundamentals_report}
+Respond with a single JSON object in this exact structure:
+{{
+  "rationale": "...",
+  "weights": {{
+    "long_term": {{"fundamental": 0.5, "technical": 0.15, "macro": 0.25, "sentiment": 0.1}},
+    "medium_term": {{...}},
+    "short_term": {{...}}
+  }},
+  "horizon_blend_weights": {{"long_term": 0.3, "medium_term": 0.4, "short_term": 0.3}}
+}}
 
-Based on the above, draft your full trade proposal for {company_name}.""",
-        }
+Output ONLY the JSON object. No markdown fences, no extra text."""
 
-        messages = [
-            {
-                "role": "system",
-                "content": f"""You are a senior institutional trader drafting a formal trade proposal for submission to the risk management desk. Your proposal must be structured, decisive, and detailed enough for the risk analysts to evaluate, challenge, and ultimately refine into an executable order.
+        phase1_result = llm.invoke([SystemMessage(content=phase1_prompt)])
+        phase1_json = _extract_json_block(phase1_result.content)
 
-Write your proposal as a cohesive, flowing document — not a form or checklist. Present your reasoning naturally, as you would in a verbal pitch to a portfolio manager, but ensure you cover all of the following elements within your narrative:
+        weights_dict = _default_equal_weights()
+        horizon_blend = {"long_term": 0.33, "medium_term": 0.33, "short_term": 0.34}
+        rationale = "Fallback to equal weights due to parse failure."
 
-1. TRADE THESIS — State your directional conviction and the core reasoning behind it. What is the setup? Why now? What edge do you see that the market may be mispricing?
+        if isinstance(phase1_json, dict):
+            rationale = phase1_json.get("rationale", rationale)
+            raw_weights = phase1_json.get("weights")
+            if isinstance(raw_weights, dict):
+                weights_dict = _normalize_weights(raw_weights)
+            raw_blend = phase1_json.get("horizon_blend_weights")
+            if isinstance(raw_blend, dict):
+                blend_vals = {
+                    "long_term": float(raw_blend.get("long_term", 0.33)),
+                    "medium_term": float(raw_blend.get("medium_term", 0.33)),
+                    "short_term": float(raw_blend.get("short_term", 0.34)),
+                }
+                total = sum(blend_vals.values())
+                if total > 0:
+                    horizon_blend = {k: v / total for k, v in blend_vals.items()}
+                else:
+                    horizon_blend = {"long_term": 0.33, "medium_term": 0.33, "short_term": 0.34}
 
-2. CONVICTION & SIZING — How confident are you? (High / Moderate / Low conviction.) What portfolio allocation do you recommend as a percentage? Scale your position size to your conviction — high conviction justifies larger positions, low conviction demands smaller or no exposure.
+        # ── Phase 2: Cross-Signal Consistency Check (LLM) ───────────────────
+        phase2_prompt = f"""You are a risk analyst reviewing multi-analyst research for contradictions.
 
-3. ENTRY STRATEGY — How should the position be initiated? A single market order for immediacy, or a limit order at a specific level? Should the entry be scaled in (e.g., 50% now, 50% on a pullback to a support level)? If scaling, specify the price levels and allocation splits.
+Analyst signals:
+{json.dumps(reports_json, indent=2)}
 
-4. PRICE TARGETS & EXIT PLAN — Where do you take profit? Specify at least one price target with reasoning (technical level, valuation multiple, catalyst timeline). If appropriate, propose a tiered exit (e.g., sell 1/3 at target 1, 1/3 at target 2, trail the rest).
+Your task:
+1. Identify contradictions between analysts (e.g., fundamental says bullish, technical says bearish).
+2. For each contradiction, specify:
+   - analyst_a and analyst_b (use exactly: fundamental, technical, macro, sentiment)
+   - horizon (long_term, medium_term, or short_term)
+   - conflict_description (1 sentence)
+   - resolution_status: "resolved" if one analyst's reasoning clearly outweighs the other, else "unresolved"
+   - conviction_penalty: a negative float between -1.0 and 0.0 (e.g., -0.15). More severe = larger magnitude.
 
-5. STOP-LOSS & DOWNSIDE PROTECTION — Where is the trade invalidated? Specify a stop-loss level and whether it should be a hard stop (stop-market), a stop-limit, or a trailing stop. Explain why this level was chosen (technical support, percentage-based max loss, volatility band, etc.). If proposing a bracket order with both take-profit and stop-loss, say so explicitly.
+Respond with a single JSON object:
+{{
+  "conflicts": [
+    {{
+      "analyst_a": "fundamental",
+      "analyst_b": "technical",
+      "horizon": "short_term",
+      "conflict_description": "Fundamental DCF implies 20% upside while technical RSI shows overbought exhaustion.",
+      "resolution_status": "unresolved",
+      "conviction_penalty": -0.12
+    }}
+  ]
+}}
 
-6. RISK/REWARD ASSESSMENT — Quantify the expected risk/reward ratio (e.g., risking 5% to gain 15% = 3:1 R/R). Is this ratio attractive enough to justify the trade given current volatility and your conviction level?
+If no contradictions exist, return {{"conflicts": []}}.
+Output ONLY the JSON object. No markdown fences, no extra text."""
 
-7. KEY CATALYSTS & TIMELINE — What upcoming events or data releases could validate or invalidate this thesis? (Earnings, Fed decisions, product launches, regulatory rulings, etc.) When do you expect the thesis to play out?
+        phase2_result = llm.invoke([SystemMessage(content=phase2_prompt)])
+        phase2_json = _extract_json_block(phase2_result.content)
 
-8. RISKS & WHAT COULD GO WRONG — Proactively identify the top 2-3 risks to this trade. What would make you wrong? This gives the risk analysts specific points to challenge.
+        conflicts: List[CrossSignalConflict] = []
+        unresolved_penalty = 0.0
+        if isinstance(phase2_json, dict):
+            raw_conflicts = phase2_json.get("conflicts", [])
+            if isinstance(raw_conflicts, list):
+                for c in raw_conflicts:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        a_type = AgentType(c.get("analyst_a", ""))
+                        b_type = AgentType(c.get("analyst_b", ""))
+                    except ValueError:
+                        continue
+                    penalty = float(c.get("conviction_penalty", 0.0))
+                    conflicts.append(
+                        CrossSignalConflict(
+                            analyst_a=a_type,
+                            analyst_b=b_type,
+                            horizon=c.get("horizon", ""),
+                            conflict_description=c.get("conflict_description", ""),
+                            resolution_status=c.get("resolution_status", "unresolved"),
+                            conviction_penalty=max(-1.0, min(0.0, penalty)),
+                        )
+                    )
+                    if c.get("resolution_status") != "resolved":
+                        unresolved_penalty += abs(penalty)
 
-IMPORTANT GUIDELINES:
-- Be specific with numbers. Don't say "set a stop-loss below support" — say "stop-loss at $142.50, just below the 200-day MA at $143.10."
-- If the analysis supports holding and there is no compelling setup, explicitly state that no trade is warranted and explain why the risk/reward is insufficient to initiate.
-- If the analysis is bearish, you may propose a short sell. State this clearly.
-- Present your proposal conversationally and naturally. Avoid bullet-point formatting — write as if you are presenting to the desk.
+        unresolved_penalty = min(unresolved_penalty, 1.0)
 
-Always conclude your proposal with a TRANSACTION SUMMARY block in this exact format:
+        # ── Phase 3: Composite Signal Math (deterministic) ──────────────────
+        # Compute per-horizon composite mu and sigma using the assigned weights.
+        mu_comp = {}
+        sigma_comp = {}
+        horizons = ["long_term", "medium_term", "short_term"]
 
-TRANSACTION SUMMARY:
-- Direction: BUY / SELL / SHORT SELL / HOLD
-- Order Strategy: (e.g., Market, Limit at $X, Bracket with TP $X / SL $X, Scaled Entry, etc.)
-- Entry: (price or "at market")
-- Stop-Loss: (price and type, or "None" for HOLD)
-- Target(s): (price level(s), or "N/A" for HOLD)
-- Risk/Reward: (ratio, e.g., "1:3.2")
-- Conviction: High / Moderate / Low
-- Suggested Allocation: (percentage of portfolio)
-- Timeframe: (expected holding period){past_reflections_section}""",
-            },
-            context,
-        ]
+        for horizon in horizons:
+            mu_h = 0.0
+            sigma_sq = 0.0
+            w = weights_dict.get(horizon, {})
+            for agent_type, report in reports.items():
+                key = AGENT_TYPE_KEYS.get(agent_type, agent_type.value)
+                weight = w.get(key, 0.0)
+                mu_val = getattr(report.mu, horizon, 0.0)
+                sigma_val = getattr(report.sigma_contribution, horizon, 0.01)
+                mu_h += weight * mu_val
+                sigma_sq += (weight ** 2) * (sigma_val ** 2)
+            mu_comp[horizon] = max(-1.0, min(1.0, mu_h))
+            sigma_comp[horizon] = max(0.001, math.sqrt(sigma_sq))
 
-        result = llm.invoke(messages)
+        # Blend horizons into final mu / sigma
+        mu_final = sum(horizon_blend[h] * mu_comp[h] for h in horizons)
+        sigma_final = math.sqrt(
+            sum((horizon_blend[h] ** 2) * (sigma_comp[h] ** 2) for h in horizons)
+        )
+        sigma_final = max(0.001, sigma_final)
+
+        # Conviction: scaled by final mu magnitude, reduced by unresolved penalties
+        raw_conviction = abs(mu_final)
+        conviction_final = max(0.0, min(1.0, raw_conviction - unresolved_penalty))
+
+        # Validate weight sums
+        weights_ok = all(
+            abs(sum(weights_dict.get(h, {}).values()) - 1.0) < 1e-6 for h in horizons
+        )
+        provenance_parts = ["weights_sum_ok" if weights_ok else "weights_sum_fail"]
+        if sigma_final > 0:
+            provenance_parts.append("sigma_ok")
+        if abs(mu_final) <= 1.0:
+            provenance_parts.append("mu_bounds_ok")
+        computation_provenance = ", ".join(provenance_parts)
+
+        # ── Build CompositeSignal ─────────────────────────────────────────────
+        analyst_weights = HorizonWeights(
+            long_term=AnalystWeights(**weights_dict.get("long_term", {})),
+            medium_term=AnalystWeights(**weights_dict.get("medium_term", {})),
+            short_term=AnalystWeights(**weights_dict.get("short_term", {})),
+        )
+
+        composite = CompositeSignal(
+            ticker=company_name,
+            timestamp=datetime.now(),
+            mu_composite=HorizonValues(**mu_comp),
+            sigma_composite=HorizonValues(**sigma_comp),
+            mu_final=mu_final,
+            sigma_final=sigma_final,
+            conviction_final=conviction_final,
+            analyst_weights=analyst_weights,
+            horizon_blend_weights=HorizonValues(**horizon_blend),
+            weighting_rationale=rationale,
+            cross_signal_conflicts=conflicts,
+            unresolved_penalty=unresolved_penalty,
+            source_reports=[at.value for at in reports.keys()],
+            computation_provenance=computation_provenance,
+        )
+
+        composite_json = composite.model_dump_json()
+
+        result_msg = HumanMessage(
+            content=f"Synthesis complete for {company_name}. "
+            f"mu_final={mu_final:.4f}, sigma_final={sigma_final:.4f}, "
+            f"conviction={conviction_final:.4f}, conflicts={len(conflicts)}."
+        )
 
         return {
-            "messages": [result],
-            "trader_investment_plan": result.content,
+            "messages": [result_msg],
+            "composite_signal": composite_json,
             "sender": name,
         }
 
-    return functools.partial(trader_node, name="Trader")
+    return functools.partial(synthesis_node, name="Synthesis Agent")

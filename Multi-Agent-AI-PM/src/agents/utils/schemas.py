@@ -8,7 +8,7 @@ from pydantic import BaseModel
 class AgentType(str, Enum):
     FUNDAMENTAL = "fundamental"
     TECHNICAL = "technical"
-    MACRO = "macro"
+    NEWS = "news"
     SENTIMENT = "sentiment"
 
 
@@ -57,6 +57,7 @@ class Citation(BaseModel):
     source: str
     source_uuid: str
 
+
 class ContributingFactor(BaseModel):
     factor_uuid: str
     factor_name: str
@@ -81,7 +82,6 @@ class HorizonTraceIds(BaseModel):
     long_term: str  # UUID of the ComputationTrace that produced this horizon's value
     medium_term: str
     short_term: str
-
 
 
 class ResearchReport(BaseModel):
@@ -115,3 +115,61 @@ class ResearchReport(BaseModel):
         Citation
     ]  # Each claim linked to a computed metric or data source
     contributing_factors: List[ContributingFactor]
+
+
+class AnalystWeights(BaseModel):
+    """Per-analyst weights for a single horizon. Must sum to 1.0 (enforced in code)."""
+
+    fundamental: float = 0.25
+    technical: float = 0.25
+    macro: float = 0.25
+    sentiment: float = 0.25
+
+
+class HorizonWeights(BaseModel):
+    """Per-horizon analyst weight allocations."""
+
+    long_term: AnalystWeights = AnalystWeights()
+    medium_term: AnalystWeights = AnalystWeights()
+    short_term: AnalystWeights = AnalystWeights()
+
+
+class CrossSignalConflict(BaseModel):
+    """Documented contradiction between two analyst signals."""
+
+    analyst_a: AgentType
+    analyst_b: AgentType
+    horizon: str  # "long_term" | "medium_term" | "short_term"
+    conflict_description: str
+    resolution_status: str  # "resolved" | "unresolved"
+    conviction_penalty: float  # -1.0 to 0.0
+
+
+class CompositeSignal(BaseModel):
+    """Structured output of the Synthesis Agent — canonical Layer 2 signal."""
+
+    # ── Identity ──
+    ticker: str
+    timestamp: datetime
+
+    # ── Per-horizon composite metrics ──
+    mu_composite: HorizonValues  # blended per-horizon expected return
+    sigma_composite: HorizonValues  # blended per-horizon volatility
+
+    # ── Unified final signal ──
+    mu_final: float  # unified expected return after horizon blending
+    sigma_final: float  # unified volatility
+    conviction_final: float  # [0, +1.0]
+
+    # ── Weighting provenance ──
+    analyst_weights: HorizonWeights  # per-analyst weights per horizon
+    horizon_blend_weights: HorizonValues  # weights used to blend long/medium/short into final
+    weighting_rationale: str
+
+    # ── Conflict documentation ──
+    cross_signal_conflicts: List[CrossSignalConflict]
+    unresolved_penalty: float  # total conviction reduction from unresolved conflicts
+
+    # ── Source tracking ──
+    source_reports: List[str]  # list of analyst AgentType values that contributed
+    computation_provenance: str  # e.g., "weights_sum_ok, psd_ok"

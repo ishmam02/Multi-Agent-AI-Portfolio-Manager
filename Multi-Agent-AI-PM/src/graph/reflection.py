@@ -1,5 +1,6 @@
 # TradingAgents/graph/reflection.py
 
+import json
 from typing import Dict, Any
 from langchain_openai import ChatOpenAI
 
@@ -15,7 +16,7 @@ class Reflector:
     def _get_reflection_prompt(self) -> str:
         """Get the system prompt for reflection."""
         return """
-You are an expert financial analyst tasked with reviewing trading decisions/analysis and providing a comprehensive, step-by-step analysis. 
+You are an expert financial analyst tasked with reviewing trading decisions/analysis and providing a comprehensive, step-by-step analysis.
 Your goal is to deliver detailed insights into investment decisions and highlight opportunities for improvement, adhering strictly to the following guidelines:
 
 1. Reasoning:
@@ -25,7 +26,7 @@ Your goal is to deliver detailed insights into investment decisions and highligh
      - Technical indicators.
      - Technical signals.
      - Price movement analysis.
-     - Overall market data analysis 
+     - Overall market data analysis
      - News analysis.
      - Social media and sentiment analysis.
      - Fundamental data analysis.
@@ -47,13 +48,29 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
 """
 
     def _extract_current_situation(self, current_state: Dict[str, Any]) -> str:
-        """Extract the current market situation from the state."""
-        curr_market_report = current_state["market_report"]
-        curr_sentiment_report = current_state["sentiment_report"]
-        curr_news_report = current_state["news_report"]
-        curr_fundamentals_report = current_state["fundamentals_report"]
+        """Extract the current market situation from the state.
 
-        return f"{curr_market_report}\n\n{curr_sentiment_report}\n\n{curr_news_report}\n\n{curr_fundamentals_report}"
+        Parses ResearchReport JSON strings to build a structured summary.
+        """
+        from src.agents.utils.schemas import ResearchReport
+
+        parts = []
+        for key in ["market_report", "sentiment_report", "news_report", "fundamentals_report"]:
+            raw = current_state.get(key, "")
+            if not raw:
+                continue
+            try:
+                report = ResearchReport.model_validate_json(raw)
+                parts.append(
+                    f"{report.agent_type.value.upper()} REPORT:\n"
+                    f"  mu: LT={report.mu.long_term:.4f} MT={report.mu.medium_term:.4f} ST={report.mu.short_term:.4f}\n"
+                    f"  conviction: LT={report.conviction.long_term:.4f} MT={report.conviction.medium_term:.4f} ST={report.conviction.short_term:.4f}\n"
+                    f"  thesis (short): {report.investment_thesis.short_term[:200]}"
+                )
+            except Exception:
+                parts.append(f"{key}: {raw[:500]}")
+
+        return "\n\n".join(parts) if parts else "No reports available."
 
     def _reflect_on_component(
         self, component_type: str, report: str, situation: str, returns_losses
@@ -71,11 +88,27 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
         return result
 
     def reflect_trader(self, current_state, returns_losses, trader_memory):
-        """Reflect on trader's decision and update memory."""
+        """Reflect on synthesis agent's decision and update memory."""
         situation = self._extract_current_situation(current_state)
-        trader_decision = current_state["trader_investment_plan"]
+        composite_raw = current_state.get("composite_signal", "")
+
+        composite_summary = "No composite signal available."
+        if composite_raw:
+            try:
+                from src.agents.utils.schemas import CompositeSignal
+                cs = CompositeSignal.model_validate_json(composite_raw)
+                composite_summary = (
+                    f"Synthesis Agent Decision:\n"
+                    f"  mu_final={cs.mu_final:.4f}\n"
+                    f"  sigma_final={cs.sigma_final:.4f}\n"
+                    f"  conviction={cs.conviction_final:.4f}\n"
+                    f"  conflicts={len(cs.cross_signal_conflicts)}\n"
+                    f"  rationale: {cs.weighting_rationale[:300]}"
+                )
+            except Exception as exc:
+                composite_summary = f"Failed to parse composite signal: {exc}"
 
         result = self._reflect_on_component(
-            "TRADER", trader_decision, situation, returns_losses
+            "SYNTHESIS", composite_summary, situation, returns_losses
         )
         trader_memory.add_situations([(situation, result)])

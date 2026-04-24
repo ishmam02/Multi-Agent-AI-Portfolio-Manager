@@ -17,6 +17,17 @@ DEFAULT_CONFIG = {
     # Provider-specific thinking configuration
     "google_thinking_level": None,  # "high", "minimal", etc.
     "openai_reasoning_effort": None,  # "medium", "high", "low"
+    # Code agent settings
+    "code_agent_model": "qwen2.5-coder:32b",
+    "code_agent_base_url": "http://localhost:11434",
+    "code_agent_timeout": 60,
+    "code_agent_max_iterations": 5,
+    # Research depth and horizons
+    "research_depth": "shallow",
+    "horizons_enabled": ["long_term", "medium_term", "short_term"],
+    "horizon_lookback": {"long_term": 365, "medium_term": 90, "short_term": 10},
+    # Cross-ticker covariance default correlation
+    "cross_ticker_correlation": 0.3,
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
@@ -28,7 +39,7 @@ DEFAULT_CONFIG = {
         "core_stock_apis": "yfinance",  # Options: alpha_vantage, yfinance
         "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
         "fundamental_data": "yfinance",  # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",  # Options: alpha_vantage, yfinance
+        "news_data": "alpaca",  # Options: alpaca, alpha_vantage, yfinance
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
