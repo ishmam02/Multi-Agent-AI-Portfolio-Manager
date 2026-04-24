@@ -222,3 +222,4 @@ cli/.saved_config.json
 **/data_cache/
 
  eval_results
+results/
