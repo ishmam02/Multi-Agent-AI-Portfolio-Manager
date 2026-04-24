@@ -85,7 +85,7 @@ def get_news_yfinance(
                 if not (start_dt <= pub_date_naive <= end_dt + relativedelta(days=1)):
                     continue
 
-            news_str += f"### {data['title']} (source: {data['publisher']})\n"
+            news_str += f"### {data['title']} (source: {data['publisher']}, date: {data['pub_date'].strftime('%Y-%m-%d') if data['pub_date'] else 'Unknown'})\n"
             if data["summary"]:
                 news_str += f"{data['summary']}\n"
             if data["link"]:
@@ -177,7 +177,24 @@ def get_global_news_yfinance(
                 link = article.get("link", "")
                 summary = ""
 
-            news_str += f"### {title} (source: {publisher})\n"
+            # Try to get date from article if available
+            article_date = "Unknown"
+            if "content" in article:
+                pub_date_str = article["content"].get("pubDate", "")
+                if pub_date_str:
+                    try:
+                        pd_dt = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                        article_date = pd_dt.strftime("%Y-%m-%d")
+                    except (ValueError, AttributeError):
+                        pass
+            elif "providerPublishTime" in article:
+                try:
+                    import time
+                    pd_dt = datetime.fromtimestamp(article["providerPublishTime"])
+                    article_date = pd_dt.strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    pass
+            news_str += f"### {title} (source: {publisher}, date: {article_date})\n"
             if summary:
                 news_str += f"{summary}\n"
             if link:

@@ -7,9 +7,15 @@ from .y_finance import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
     get_income_statement as get_yfinance_income_statement,
+    get_earnings_dates as get_yfinance_earnings_dates,
+    get_quarterly_history as get_yfinance_quarterly_history,
     get_insider_transactions as get_yfinance_insider_transactions,
 )
 from .yfinance_news import get_news_yfinance, get_global_news_yfinance
+from .alpaca import (
+    get_alpaca_news,
+    get_alpaca_global_news,
+)
 from .alpha_vantage import (
     get_stock as get_alpha_vantage_stock,
     get_fundamentals as get_alpha_vantage_fundamentals,
@@ -39,7 +45,9 @@ TOOLS_CATEGORIES = {
             "get_fundamentals",
             "get_balance_sheet",
             "get_cashflow",
-            "get_income_statement"
+            "get_income_statement",
+            "get_earnings_dates",
+            "get_quarterly_history",
         ]
     },
     "news_data": {
@@ -81,12 +89,20 @@ VENDOR_METHODS = {
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
+    "get_earnings_dates": {
+        "yfinance": get_yfinance_earnings_dates,
+    },
+    "get_quarterly_history": {
+        "yfinance": get_yfinance_quarterly_history,
+    },
     # news_data
     "get_news": {
+        "alpaca": get_alpaca_news,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
     },
     "get_global_news": {
+        "alpaca": get_alpaca_global_news,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
@@ -134,6 +150,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    last_error: Exception | None = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -144,6 +161,13 @@ def route_to_vendor(method: str, *args, **kwargs):
         try:
             return impl_func(*args, **kwargs)
         except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+            continue
+        except Exception as exc:
+            last_error = exc
+            continue
 
+    if last_error is not None:
+        raise RuntimeError(
+            f"No available vendor for '{method}'"
+        ) from last_error
     raise RuntimeError(f"No available vendor for '{method}'")

@@ -6,10 +6,11 @@ from src.agents.utils.fundamental_data_tools import (
     get_balance_sheet,
     get_cashflow,
     get_income_statement,
+    get_earnings_dates,
+    get_quarterly_history,
 )
 from src.agents.utils.news_data_tools import (
     get_news,
     get_insider_transactions,
     get_global_news,
 )
-

@@ -75,3 +75,35 @@ def get_income_statement(
         str: A formatted report containing income statement data
     """
     return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+
+
+@tool
+def get_earnings_dates(
+    ticker: Annotated[str, "ticker symbol"],
+) -> str:
+    """
+    Retrieve earnings dates with actual and estimated EPS for a given ticker.
+    Uses the configured fundamental_data vendor.
+    Args:
+        ticker (str): Ticker symbol of the company
+    Returns:
+        str: A CSV with columns EPS Estimate, Reported EPS, Surprise(%)
+             indexed by Earnings Date (typically ~25 quarters)
+    """
+    return route_to_vendor("get_earnings_dates", ticker)
+
+
+@tool
+def get_quarterly_history(
+    ticker: Annotated[str, "ticker symbol"],
+) -> str:
+    """
+    Retrieve quarterly price history (OHLCV) for a given ticker.
+    Uses the configured fundamental_data vendor.
+    Args:
+        ticker (str): Ticker symbol of the company
+    Returns:
+        str: A CSV with columns Open, High, Low, Close, Volume, Dividends, Stock Splits
+             indexed by Date (typically ~100+ quarters)
+    """
+    return route_to_vendor("get_quarterly_history", ticker)

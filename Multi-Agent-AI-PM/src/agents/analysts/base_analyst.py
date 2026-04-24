@@ -146,9 +146,9 @@ def _log(
 # ── Constants ────────────────────────────────────────────────────────────────
 
 HORIZON_LOOKBACK = {
-    "long_term": 365,
-    "medium_term": 90,
-    "short_term": 30,
+    "long_term": 365*4,
+    "medium_term": 90*4,
+    "short_term": 30*4,
 }
 
 MAX_PASSES = {
@@ -683,17 +683,20 @@ def build_3phase_subgraph(
         trade_date = sub_state["trade_date"]
         horizon = sub_state["horizon"]
         lookback = HORIZON_LOOKBACK[horizon]
+        # Extend lookback by 300 trading days so the k-NN search space has
+        # enough historical points with valid forward returns (t+h exists).
+        extended_lookback = lookback + 300
 
         _log(
             f"{agent_type.value}|{ticker}|{horizon}",
-            f"data_gathering: horizon={horizon} lookback={lookback}d",
+            f"data_gathering: horizon={horizon} lookback={lookback}d extended={extended_lookback}d",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
 
-        raw_data = gather_fn(ticker, trade_date, lookback)
+        raw_data = gather_fn(ticker, trade_date, extended_lookback)
 
         # Assign source UUIDs for provenance tracking
         sourced_data: Dict[str, GatheredEntry] = {}
@@ -1303,18 +1306,20 @@ def build_3phase_subgraph(
         # Conviction measures confidence in the mu/sigma calculation itself,
         # NOT the signal strength (direction is in mu, magnitude in sigma).
         #
-        # For technical (market) analysts with signal_concordance:
-        #   conviction = clip(
-        #     0.50 * signal_concordance     # indicator agreement
-        #   + 0.20 * regime_clarity        # clear vs ambiguous regime
-        #   + 0.15 * signal_strength      # |mu| magnitude
-        #   + 0.15 * data_completeness,    # metric coverage
-        #   0, 1)
+        # Uses a logit-sigmoid formulation so that ANY weak component can
+        # push conviction toward 0.5 (neutral), and strong agreement across
+        # all components pushes it toward 1.0. This gives much wider dynamic
+        # range than a weighted sum.
         #
-        # regime_clarity: 1.0 if Kaufman ER < 0.20 or ER > 0.40 (clear
-        #   regime); 0.5 if ER is between 0.20 and 0.40 (ambiguous).
-        #   Defaults to 0.5 if ER not available.
-        # signal_strength: min(|mu| / 0.04, 1.0) — |mu| >= 4% is "strong"
+        # Components (all mapped to [0, 1]):
+        #   c  = signal_concordance   [0, 1]   directional agreement
+        #   d  = dispersion_score     [0, 1]   1 - stdev(signals)/0.05
+        #   r  = regime_clarity       [0.5, 1] clear vs ambiguous regime
+        #   s  = signal_significance  [0, 1]   min(|mu| / 0.02, 1.0)
+        #   dc = data_completeness    [0, 1]   n_computed / n_planned
+        #
+        # Logit = 3.0*(c-0.5) + 1.5*(d-0.5) + 0.8*(r-0.5) + 0.8*(s-0.5) + 0.4*(dc-0.5)
+        # conviction = 1 / (1 + exp(-2*logit))
         #
         # Fallback: if signal_concordance is not in computed_metrics (e.g.
         # non-technical analysts), fall back to a |mu|/sigma signal-to-noise
@@ -1324,6 +1329,8 @@ def build_3phase_subgraph(
         # the calculation, not direction (direction is already in mu).
         # If sigma is at floor (0.01) or fewer than 2 metrics computed,
         # conviction defaults to 0.0 (insufficient data).
+        import math
+
         n_computed = len(computed_metrics)
         n_planned = len(sub_state["computation_plan"].get("computation_plan", []))
         data_completeness = min(n_computed / max(n_planned, 1), 1.0)
@@ -1339,6 +1346,17 @@ def build_3phase_subgraph(
                     signal_concordance = None
                 break
 
+        # Extract signal_dispersion from computed_metrics
+        signal_dispersion: Optional[float] = None
+        for m in computed_metrics:
+            if m.metric_name == "signal_dispersion" and m.value is not None:
+                try:
+                    signal_dispersion = float(m.value)
+                    signal_dispersion = max(0.0, signal_dispersion)
+                except (TypeError, ValueError):
+                    signal_dispersion = None
+                break
+
         if sigma <= 0.0101 or n_computed < 2:
             deterministic_conviction = 0.0
             _log(
@@ -1351,8 +1369,13 @@ def build_3phase_subgraph(
                 else "",
             )
         elif signal_concordance is not None:
-            # Multi-component conviction formula
-            # 1. regime_clarity: clear regime = 1.0, ambiguous = 0.5
+            # 1. dispersion_score: high dispersion → low score
+            if signal_dispersion is not None:
+                dispersion_score = max(0.0, 1.0 - signal_dispersion / 0.05)
+            else:
+                dispersion_score = 0.5  # default if missing
+
+            # 2. regime_clarity: clear regime = 1.0, ambiguous = 0.5
             regime_clarity = 0.5  # default if ER not available
             for m in computed_metrics:
                 if m.metric_name == "kaufman_efficiency_ratio" and m.value is not None:
@@ -1366,24 +1389,31 @@ def build_3phase_subgraph(
                         pass
                     break
 
-            # 2. signal_strength: how far from neutral
-            signal_strength = min(abs(mu) / 0.04, 1.0)
+            # 3. signal_significance: how far from neutral (lowered threshold)
+            signal_significance = min(abs(mu) / 0.02, 1.0)
 
-            raw_conviction = (
-                0.50 * signal_concordance
-                + 0.20 * regime_clarity
-                + 0.15 * signal_strength
-                + 0.15 * data_completeness
+            # Logit-sigmoid conviction (non-linear, wider dynamic range)
+            logit = (
+                3.0 * (signal_concordance - 0.5)
+                + 1.5 * (dispersion_score - 0.5)
+                + 0.8 * (regime_clarity - 0.5)
+                + 0.8 * (signal_significance - 0.5)
+                + 0.4 * (data_completeness - 0.5)
             )
-            deterministic_conviction = round(min(raw_conviction, 1.0), 2)
+            raw_conviction = 1.0 / (1.0 + math.exp(-2.0 * logit))
+            deterministic_conviction = round(max(0.0, min(raw_conviction, 1.0)), 2)
+
             _log(
                 f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
                 f"phase4_output: deterministic conviction: "
                 f"mu={mu:.4f} sigma={sigma:.4f} "
                 f"signal_concordance={signal_concordance:.2f} "
+                f"dispersion={signal_dispersion if signal_dispersion is not None else 'N/A'} "
+                f"dispersion_score={dispersion_score:.2f} "
                 f"regime_clarity={regime_clarity:.2f} "
-                f"signal_strength={signal_strength:.2f} "
+                f"signal_significance={signal_significance:.2f} "
                 f"data_completeness={data_completeness:.2f} "
+                f"logit={logit:.2f} "
                 f"conviction={deterministic_conviction:.2f} "
                 f"(LLM was {thesis['conviction']:.2f})",
                 verbose=verbose,

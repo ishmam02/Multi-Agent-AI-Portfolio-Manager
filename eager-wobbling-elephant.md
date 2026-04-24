@@ -322,9 +322,7 @@ Each analyst outputs a full **`ResearchReport`** (the common schema from Step 1)
 ### Multi-Horizon Caching
 
 Each horizon has different freshness requirements following institutional practice:
-- **Long-Term (Quarterly)**: Cached and **reused** until a material event trigger (new 10-K/10-Q filing, material corporate event). Not recomputed on every run.
-- **Medium-Term (Weekly)**: Cached at the weekly level. Updated weekly or when triggered by material news. Reused within the same week.
-- **Short-Term (Daily)**: Computed **fresh** on every run. Never cached.
+- **Short-Term (Daily)**: Computed **fresh** on every run.
 
 The analyst node checks the cache before running each horizon's sub-graph. If a valid cached result exists (within its freshness window), the sub-graph is skipped and the cached `HorizonAnalysis` is used directly. This reduces LLM calls significantly for repeated analysis of the same ticker.
 
@@ -404,42 +402,6 @@ for horizon in ["long_term", "medium_term", "short_term"]:
         horizon_results[horizon] = result
 ```
 
----
-
-## Step 7: Integration — State and Graph Wiring
-
-*(Horizon compositing is handled by the Synthesis Agent in Step 8, not a separate component.)*
-
-**Modify** `src/agents/utils/agent_states.py`:
-- Replace old report fields with: `fundamental_report`, `technical_report`, `macro_report`, `sentiment_report` (all JSON strings containing serialized `ResearchReport`)
-- Remove legacy fields (`market_report`, `news_report`, `fundamentals_report`)
-
-**Modify** `src/graph/setup.py`:
-- New analyst types: `["fundamental", "technical", "macro", "sentiment"]`
-- New report_keys_map mapping to new state fields
-- Simplified conditional edges (sub-graphs are self-contained, no parent-level tool loops)
-
-**Modify** `src/graph/trading_graph.py`:
-- Create **4 separate `CodeValidationAgent` instances**, each with an analyst-specific system prompt and allowed library set:
-  - `fundamental_code_agent` (valuation, accounting, financial modeling)
-  - `technical_code_agent` (indicators, signal processing, regime detection)
-  - `macro_code_agent` (macro modeling, regime classification, rate sensitivity)
-  - `sentiment_code_agent` (sentiment quantification, behavioral signals)
-- Plus a **5th `synthesis_code_agent`** for the Synthesis Agent (portfolio mathematics)
-- All 5 use the same Ollama model but differ in system prompt and allowed libs
-- Update `_create_tool_nodes()` with new tool sets for each analyst
-- Pass reasoning LLM + analyst-specific code agent to each analyst factory
-- Pass synthesis_code_agent to the Synthesis Agent factory
-- Remove old analyst references
-
-**Modify** `src/graph/conditional_logic.py`:
-- Simplify: no more tool-loop routing, just check if report field is populated
-
-**Modify** `src/graph/propagation.py`:
-- Initialize new state fields to empty strings
-
----
-
 ## Step 8: LLM Synthesis Agent (Replaces Trader)
 
 **Replace** `src/agents/trader/trader.py` with a new Synthesis Agent that performs dynamic signal aggregation instead of simple report consumption.
@@ -450,9 +412,8 @@ for horizon in ["long_term", "medium_term", "short_term"]:
 class AnalystWeights(BaseModel):
     """Per-horizon weights for each analyst signal."""
     fundamental: float    # w_f
-    technical: float      # w_t
-    macro: float          # w_m
-    sentiment: float      # w_s
+    market: float      # w_m
+    news: float          # w_n
     justification: str    # Why these weights for this stock/horizon
 
 class CrossSignalConflict(BaseModel):
@@ -480,8 +441,8 @@ class CompositeSignal(BaseModel):
 **Rewrite** `src/agents/trader/trader.py` → `create_synthesis_agent(llm, code_agent, memory)`:
 
 **Phase 1 — Dynamic Weight Assignment (LLM):**
-- Deserialize all 4 `ResearchReport` objects from state
-- LLM reads all reports and determines per-analyst, per-horizon weights (w_f, w_t, w_m, w_s) for this specific stock in the current market context
+- Deserialize all 3 `ResearchReport` objects from state
+- LLM reads all reports and determines per-analyst, per-horizon weights (w_f, w_t, w_m, w_s) for this specific stock in the current market context based on the investment thesis and catalyst and risks
 - LLM provides written justification for weighting rationale
 - Weights must sum to 1.0 per horizon
 
@@ -490,21 +451,18 @@ class CompositeSignal(BaseModel):
 - Each conflict is documented with a `CrossSignalConflict` object
 - Conviction is adjusted downward for unresolved contradictions
 
-**Phase 3 — Composite Signal Generation (Code via Claude Agent SDK):**
-- Code agent computes the composite signal mathematically:
+**Phase 3 — Composite Signal Generation:**
+- Fixed formulae computes the composite signal mathematically:
   ```
   μ_composite(h) = w_f(h)·μ_fund(h) + w_t(h)·μ_tech(h) + w_m(h)·μ_macro(h) + w_s(h)·μ_sent(h)
   ```
   for each horizon h
-- Code agent blends per-horizon composites into unified μ_final using LLM-determined horizon weights
-- Code agent computes covariance matrix Σ across the Analyzed Universe from individual analyst sigma outputs
+- Fixed formulae blends per-horizon composites into unified μ_final using LLM-determined horizon weights
+- Fixed formulae computes covariance matrix Σ across the Analyzed Universe from individual analyst sigma outputs
 - Code validates mathematical consistency (weights sum to 1, μ within bounds, Σ positive semi-definite)
 
 **Output**: The Synthesis Agent outputs the `CompositeSignal` (mu_final, sigma_final, conviction_final, per-horizon weights, conflicts, weighting rationale). **Trade proposal generation (direction, entry, targets, stop-loss, etc.) is NOT done here** — it belongs to Layer 3 (Portfolio Management). The Synthesis Agent's job ends at producing the composite conviction signal with full provenance.
 
-### 8c: Synthesis reads both numerics and interpretations
-
-The Synthesis Agent reads each analyst's `computed_metrics` — both the numerical `value` and the LLM's `interpretation`. This is critical: for a biotech, the Fundamental Analyst might report `pipeline_valuation: $2.3B` with interpretation "Phase 3 trial readout in Q2 creates binary event risk." The Synthesis Agent uses the interpretation to decide weighting, not just the number.
 
 ### 8d: State Changes
 
@@ -514,11 +472,7 @@ Add to `AgentState`:
 
 ### 8e: Memory Integration
 
-The Synthesis Agent uses `FinancialSituationMemory` (existing BM25-based memory at `src/agents/utils/memory.py`). The current situation is built from the structured reports (concatenating thesis summaries and key metrics from all 4 reports). Past similar situations are retrieved and included in the Synthesis Agent's context for Phases 1 and 4, helping avoid past mistakes.
-
-### 8f: 5th Code Agent Instance
-
-The Synthesis Agent gets its own dedicated `CodeValidationAgent` instance (`synthesis_code_agent`) with a system prompt focused on **portfolio mathematics**: weighted signal aggregation, covariance matrix computation, positive semi-definiteness checks, and mathematical consistency validation.
+The Synthesis Agent uses `FinancialSituationMemory` (existing BM25-based memory at `src/agents/utils/memory.py`). The current situation is built from the structured reports (concatenating investment thesis and catalyst and risks from all 3 reports). Past similar situations are retrieved and included in the Synthesis Agent's context for Phases 1, helping avoid past mistakes.
 
 ### 8g: Multi-Ticker Covariance
 
@@ -526,7 +480,34 @@ When `propagate_multi()` runs multiple tickers, after all individual syntheses c
 
 ---
 
-## Step 9: Parent-Level Error Handling
+## Step 9: Integration — State and Graph Wiring
+
+*(Horizon compositing is handled by the Synthesis Agent in Step 8, not a separate component.)*
+
+**Modify** `src/agents/utils/agent_states.py`:
+ fields (`market_report`, `news_report`, `fundamentals_report`)
+
+**Modify** `src/graph/setup.py`:
+- New analyst types: `["fundamental", "market", "news"]`
+- New report_keys_map mapping to new state fields
+- Simplified conditional edges (sub-graphs are self-contained, no parent-level tool loops)
+
+**Modify** `src/graph/trading_graph.py`:
+- Create **3 separate `CodeValidationAgent` instances**, each with an analyst-specific system prompt and allowed library set:
+  - `fundamental_code_agent` (valuation, accounting, financial modeling)
+  - `market_code_agent` (indicators, signal processing, regime detection)
+  - `news_code_agent` (sentiment quantification, behavioral signals)
+- All 3 use the same Ollama model but differ in system prompt and allowed libs
+- Update `_create_tool_nodes()` with new tool sets for each analyst
+- Pass reasoning LLM + analyst-specific code agent to each analyst factory
+- Pass synthesis_code_agent to the Synthesis Agent factory
+- Remove old analyst references
+
+**Modify** `src/graph/conditional_logic.py`:
+- Simplify: no more tool-loop routing, just check if report field is populated
+
+**Modify** `src/graph/propagation.py`:
+- Initialize new state fields to empty strings
 
 **Modify** `src/graph/setup.py` and `src/graph/trading_graph.py`:
 
@@ -555,7 +536,7 @@ Each analyst node wrapper catches exceptions and retries with exponential backof
 ## Step 11: CLI Updates
 
 **Modify** `cli/main.py`:
-- Analyst selection updated: offer `["fundamental", "technical", "macro", "sentiment"]` instead of old types
+- Analyst selection updated: offer `["fundamental", "market", "news"]` instead of old types
 - `MessageBuffer` progress tracking updated for new agent names and 3-phase workflow stages
 - Streaming output shows per-horizon progress (e.g., "Fundamental Analyst: long_term thesis → code validation → ✓")
 - Results display shows structured output: composite mu, conviction, key metrics, conflicts
