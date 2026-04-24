@@ -62,7 +62,8 @@ def create_market_analyst(reasoning_llm, code_agent, research_depth="medium"):
     research_depth : "shallow" | "medium" | "deep"
     """
     analyst_config = {
-        "agent_type": AgentType.TECHNICAL,
+        "agent_type": AgentType.MARKET,
+        "log_tag": "market",
         "state_key": "market_report",
         "gather_fn": gather_technical_data,
         "phase1_system_prompt": PHASE1_PROMPT,

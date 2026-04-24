@@ -123,7 +123,6 @@ ANALYST_LIBRARIES: dict[str, list[str]] = {
     "fundamental": ["numpy", "pandas", "scipy"] + _COMMON_LIBS,
     "market": ["numpy", "pandas", "talib", "scipy", "scikit-learn"] + _COMMON_LIBS,
     "news": ["numpy", "pandas", "scipy", "statsmodels"] + _COMMON_LIBS,
-    "sentiment": ["numpy", "pandas", "scipy"] + _COMMON_LIBS,
 }
 
 # ── Load prompts from external markdown file ────────────────────────────────
@@ -176,7 +175,7 @@ class CodeValidationAgent:
         timeout        : Per-subprocess timeout multiplier (seconds).
         max_iterations : Controls the subprocess deadline:
                          deadline = timeout × max_iterations × 6.
-        analyst_type   : One of "fundamental", "market", "news", "sentiment".
+        analyst_type   : One of "fundamental", "market", "news".
         verbose        : If True, stream every agent event to stdout in real time.
         project_root   : Explicit path to Multi-Agent-AI-PM/.  If None, auto-
                          detected via pyproject.toml marker.

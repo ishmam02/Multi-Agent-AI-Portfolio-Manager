@@ -7,9 +7,8 @@ from pydantic import BaseModel
 
 class AgentType(str, Enum):
     FUNDAMENTAL = "fundamental"
-    TECHNICAL = "technical"
+    MARKET = "market"
     NEWS = "news"
-    SENTIMENT = "sentiment"
 
 
 class Metrics(BaseModel):
@@ -120,10 +119,9 @@ class ResearchReport(BaseModel):
 class AnalystWeights(BaseModel):
     """Per-analyst weights for a single horizon. Must sum to 1.0 (enforced in code)."""
 
-    fundamental: float = 0.25
-    technical: float = 0.25
-    macro: float = 0.25
-    sentiment: float = 0.25
+    fundamental: float = 0.33
+    market: float = 0.33
+    news: float = 0.34
 
 
 class HorizonWeights(BaseModel):
@@ -163,7 +161,9 @@ class CompositeSignal(BaseModel):
 
     # ── Weighting provenance ──
     analyst_weights: HorizonWeights  # per-analyst weights per horizon
-    horizon_blend_weights: HorizonValues  # weights used to blend long/medium/short into final
+    horizon_blend_weights: (
+        HorizonValues  # weights used to blend long/medium/short into final
+    )
     weighting_rationale: str
 
     # ── Conflict documentation ──

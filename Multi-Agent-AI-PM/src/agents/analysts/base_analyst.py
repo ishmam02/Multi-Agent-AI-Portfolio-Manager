@@ -1678,6 +1678,7 @@ def create_analyst_node(
     """
     agent_type: AgentType = analyst_config["agent_type"]
     state_key: str = analyst_config["state_key"]
+    log_tag: str = analyst_config.get("log_tag", agent_type.value)
 
     sub_graph = build_3phase_subgraph(
         reasoning_llm, code_agent, analyst_config, verbose=verbose
@@ -1688,7 +1689,7 @@ def create_analyst_node(
         trade_date = state["trade_date"]
 
         _log(
-            agent_type.value,
+            log_tag,
             f"Starting analysis for {ticker} on {trade_date} (depth={research_depth})",
             verbose=verbose,
             trade_date=trade_date,
@@ -1750,7 +1751,7 @@ def create_analyst_node(
             }
             result = sub_graph.invoke(sub_state)
             _log(
-                f"{agent_type.value}|{ticker}|{horizon}",
+                f"{log_tag}|{ticker}|{horizon}",
                 f"Completed horizon: {horizon}",
                 verbose=verbose,
                 trade_date=trade_date,
@@ -1794,7 +1795,7 @@ def create_analyst_node(
             f.write("\n")
 
         _log(
-            f"{agent_type.value}|{ticker}|_",
+            f"{log_tag}|{ticker}|_",
             f"Final report logged to {report_log_path}",
             verbose=verbose,
             trade_date=trade_date,

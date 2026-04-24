@@ -33,17 +33,15 @@ from src.agents.utils.schemas import (
 # ── Constants ────────────────────────────────────────────────────────────────
 
 AGENT_TYPE_MAP = {
-    "market_report": AgentType.TECHNICAL,
-    "sentiment_report": AgentType.SENTIMENT,
+    "market_report": AgentType.MARKET,
     "news_report": AgentType.NEWS,
     "fundamentals_report": AgentType.FUNDAMENTAL,
 }
 
 AGENT_TYPE_KEYS = {
     AgentType.FUNDAMENTAL: "fundamental",
-    AgentType.TECHNICAL: "technical",
-    AgentType.NEWS: "macro",
-    AgentType.SENTIMENT: "sentiment",
+    AgentType.MARKET: "market",
+    AgentType.NEWS: "news",
 }
 
 
@@ -88,15 +86,14 @@ def _normalize_weights(weights: dict) -> dict:
             w = {}
         vals = {
             "fundamental": float(w.get("fundamental", 0.0)),
-            "technical": float(w.get("technical", 0.0)),
-            "macro": float(w.get("macro", 0.0)),
-            "sentiment": float(w.get("sentiment", 0.0)),
+            "market": float(w.get("market", 0.0)),
+            "news": float(w.get("news", 0.0)),
         }
         total = sum(vals.values())
         if total > 0:
             vals = {k: v / total for k, v in vals.items()}
         else:
-            vals = {k: 0.25 for k in vals}
+            vals = {k: 1.0 / len(vals) for k in vals}
         normalized[horizon] = vals
     return normalized
 
@@ -104,9 +101,9 @@ def _normalize_weights(weights: dict) -> dict:
 def _default_equal_weights() -> dict:
     """Return equal weights for all analysts across all horizons."""
     return {
-        "long_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
-        "medium_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
-        "short_term": {"fundamental": 0.25, "technical": 0.25, "macro": 0.25, "sentiment": 0.25},
+        "long_term": {"fundamental": 0.34, "market": 0.33, "news": 0.33},
+        "medium_term": {"fundamental": 0.34, "market": 0.33, "news": 0.33},
+        "short_term": {"fundamental": 0.34, "market": 0.33, "news": 0.33},
     }
 
 
@@ -235,7 +232,7 @@ Respond with a single JSON object in this exact structure:
 {{
   "rationale": "...",
   "weights": {{
-    "long_term": {{"fundamental": 0.5, "technical": 0.15, "macro": 0.25, "sentiment": 0.1}},
+    "long_term": {{"fundamental": 0.34, "market": 0.33, "news": 0.33}},
     "medium_term": {{...}},
     "short_term": {{...}}
   }},
@@ -276,9 +273,9 @@ Analyst signals:
 {json.dumps(reports_json, indent=2)}
 
 Your task:
-1. Identify contradictions between analysts (e.g., fundamental says bullish, technical says bearish).
+1. Identify contradictions between analysts (e.g., fundamental says bullish, market says bearish).
 2. For each contradiction, specify:
-   - analyst_a and analyst_b (use exactly: fundamental, technical, macro, sentiment)
+   - analyst_a and analyst_b (use exactly: fundamental, market, news)
    - horizon (long_term, medium_term, or short_term)
    - conflict_description (1 sentence)
    - resolution_status: "resolved" if one analyst's reasoning clearly outweighs the other, else "unresolved"
@@ -289,9 +286,9 @@ Respond with a single JSON object:
   "conflicts": [
     {{
       "analyst_a": "fundamental",
-      "analyst_b": "technical",
+      "analyst_b": "market",
       "horizon": "short_term",
-      "conflict_description": "Fundamental DCF implies 20% upside while technical RSI shows overbought exhaustion.",
+      "conflict_description": "Fundamental DCF implies 20% upside while market RSI shows overbought exhaustion.",
       "resolution_status": "unresolved",
       "conviction_penalty": -0.12
     }}

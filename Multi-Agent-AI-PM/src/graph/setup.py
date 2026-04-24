@@ -32,7 +32,7 @@ class GraphSetup:
         ----------
         reasoning_llm      : LLM for Phase 1 (plan) and Phase 3 (thesis)
         code_agents        : Dict mapping analyst key -> CodeValidationAgent
-                             e.g. {"market": CodeValidationAgent(..., analyst_type="technical")}
+                             e.g. {"market": CodeValidationAgent(..., analyst_type="market")}
         trader_memory      : FinancialSituationMemory for the synthesis agent
         quick_thinking_llm : LLM for the synthesis node (falls back to reasoning_llm)
         research_depth     : "shallow" | "medium" | "deep"
