@@ -14,6 +14,8 @@ Empirical core:
   • Macro regime signal: bullish/bearish keyword ratio from global news
 """
 
+import json
+
 from src.agents.utils.schemas import AgentType
 from src.agents.analysts.base_analyst import (
     create_analyst_node,
@@ -96,7 +98,7 @@ if __name__ == "__main__":
     _project_root = str(pathlib.Path(__file__).resolve().parents[3])
 
     TICKER = "AAPL"
-    TRADE_DATE = "2025-03-14"
+    TRADE_DATE = "2026-04-24"
     RESEARCH_DEPTH = "shallow"
     RANDOM_SEED = 42
 
@@ -145,7 +147,7 @@ if __name__ == "__main__":
 
     print(f"\n{'=' * 60}")
     print("Full Report.")
-    print(report)
+    print(json.dumps(report, indent=2))
     print(f"{'=' * 60}")
 
     print(f"\n{'=' * 60}")
@@ -161,8 +163,8 @@ if __name__ == "__main__":
     print(f"\nconviction:")
     print(f"  long_term   = {report.conviction.long_term:.4f}")
 
-    print(f"\nthesis (first 300 chars):")
-    print(report.investment_thesis[:300] + "...")
+    print(f"\nthesis")
+    print(report.investment_thesis)
 
     print(f"\ncomputed_metrics ({len(report.computed_metrics)}):")
     for m in report.computed_metrics:
