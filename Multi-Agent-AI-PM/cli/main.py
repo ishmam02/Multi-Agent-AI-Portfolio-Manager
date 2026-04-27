@@ -1,5 +1,6 @@
 from typing import Optional
 import datetime
+import json
 import typer
 from pathlib import Path
 from functools import wraps
@@ -47,14 +48,11 @@ class MessageBuffer:
     # Fixed teams that always run (not user-selectable)
     FIXED_AGENTS = {
         "Trading Team": ["Trader"],
-        "Portfolio Management": ["Portfolio Manager"],
     }
 
     # Analyst name mapping
     ANALYST_MAPPING = {
         "market": "Market Analyst",
-        "social": "Social Analyst",
-        "news": "News Analyst",
         "fundamentals": "Fundamentals Analyst",
     }
 
@@ -63,8 +61,6 @@ class MessageBuffer:
     # finalizing_agent: which agent must be "completed" for this report to count as done
     REPORT_SECTIONS = {
         "market_report": ("market", "Market Analyst"),
-        "sentiment_report": ("social", "Social Analyst"),
-        "news_report": ("news", "News Analyst"),
         "fundamentals_report": ("fundamentals", "Fundamentals Analyst"),
         "composite_signal": (None, "Synthesis Agent"),
     }
@@ -84,7 +80,7 @@ class MessageBuffer:
         """Initialize agent status and report sections based on selected analysts.
 
         Args:
-            selected_analysts: List of analyst type strings (e.g., ["market", "news"])
+            selected_analysts: List of analyst type strings (e.g., ["market", "fundamentals"])
         """
         self.selected_analysts = [a.lower() for a in selected_analysts]
 
@@ -122,7 +118,7 @@ class MessageBuffer:
         1. The report section has content (not None), AND
         2. The agent responsible for finalizing that report has status "completed"
 
-        This prevents interim updates (like debate rounds) from counting as completed.
+        This prevents interim updates from counting as completed.
         """
         count = 0
         for section in self.report_sections:
@@ -169,13 +165,12 @@ class MessageBuffer:
             # Format the current section for display
             section_titles = {
                 "market_report": "Market Analysis",
-                "sentiment_report": "Social Sentiment",
-                "news_report": "News Analysis",
                 "fundamentals_report": "Fundamentals Analysis",
                 "composite_signal": "Synthesis Signal",
             }
             self.current_report = (
-                f"### {section_titles[latest_section]}\n{latest_content}"
+                f"### {section_titles[latest_section]}\n"
+                f"{_fmt_report_content(latest_content)}"
             )
 
         # Update the final complete report
@@ -187,35 +182,41 @@ class MessageBuffer:
         # Analyst Team Reports - use .get() to handle missing sections
         analyst_sections = [
             "market_report",
-            "sentiment_report",
-            "news_report",
             "fundamentals_report",
         ]
         if any(self.report_sections.get(section) for section in analyst_sections):
             report_parts.append("## Analyst Team Reports")
             if self.report_sections.get("market_report"):
                 report_parts.append(
-                    f"### Market Analysis\n{self.report_sections['market_report']}"
-                )
-            if self.report_sections.get("sentiment_report"):
-                report_parts.append(
-                    f"### Social Sentiment\n{self.report_sections['sentiment_report']}"
-                )
-            if self.report_sections.get("news_report"):
-                report_parts.append(
-                    f"### News Analysis\n{self.report_sections['news_report']}"
+                    f"### Market Analysis\n"
+                    f"{_fmt_report_content(self.report_sections['market_report'])}"
                 )
             if self.report_sections.get("fundamentals_report"):
                 report_parts.append(
-                    f"### Fundamentals Analysis\n{self.report_sections['fundamentals_report']}"
+                    f"### Fundamentals Analysis\n"
+                    f"{_fmt_report_content(self.report_sections['fundamentals_report'])}"
                 )
 
         # Trading Team Reports
         if self.report_sections.get("composite_signal"):
             report_parts.append("## Trading Team Plan")
-            report_parts.append(f"{self.report_sections['composite_signal']}")
+            report_parts.append(
+                _fmt_report_content(self.report_sections["composite_signal"])
+            )
 
         self.final_report = "\n\n".join(report_parts) if report_parts else None
+
+
+def _fmt_report_content(content: str) -> str:
+    """Try to pretty-print JSON report content; fall back to raw text."""
+    if not content:
+        return content
+    try:
+        parsed = json.loads(content)
+        pretty = json.dumps(parsed, indent=2)
+        return f"```json\n{pretty}\n```"
+    except Exception:
+        return content
 
 
 message_buffer = MessageBuffer()
@@ -258,12 +259,9 @@ def _render_status_cell(status):
 ALL_TEAMS = {
     "Analyst Team": [
         "Market Analyst",
-        "Social Analyst",
-        "News Analyst",
         "Fundamentals Analyst",
     ],
     "Trading Team": ["Trader"],
-    "Portfolio Management": ["Portfolio Manager"],
 }
 
 
@@ -475,6 +473,24 @@ def get_user_selections():
                 )
                 selected_ticker = get_ticker()
 
+            # Backfill any new keys missing from old saved configs
+            if "code_agent_model" not in saved:
+                console.print(
+                    create_question_box(
+                        "Code Agent", "Configure the code validation agent model"
+                    )
+                )
+                saved["code_agent_model"] = select_code_agent_model(
+                    saved.get("llm_provider", "ollama")
+                )
+            if "horizons_enabled" not in saved:
+                console.print(
+                    create_question_box(
+                        "Horizons", "Select investment time horizons"
+                    )
+                )
+                saved["horizons_enabled"] = ask_horizons()
+
             return {
                 **saved,
                 "analysis_date": analysis_date,
@@ -568,18 +584,27 @@ def get_user_selections():
         )
         reasoning_effort = ask_openai_reasoning_effort()
 
-    # Step 8: Risk profile
+    # Step 8: Code agent
     console.print(
         create_question_box(
-            "Step 8: Risk Profile", "Configure your investment risk profile"
+            "Step 8: Code Agent",
+            "Configure the LLM that validates analyst code execution",
         )
     )
-    risk_profile = configure_risk_profile()
+    code_agent_model = select_code_agent_model(selected_llm_provider.lower())
 
-    # Step 9: Alpaca credentials
+    # Step 9: Horizons
     console.print(
         create_question_box(
-            "Step 9: Alpaca Paper Trading",
+            "Step 9: Investment Horizons", "Select time horizons for analysis"
+        )
+    )
+    horizons_enabled = ask_horizons()
+
+    # Step 10: Alpaca credentials
+    console.print(
+        create_question_box(
+            "Step 10: Alpaca Paper Trading",
             "Enter your Alpaca Paper Trading API credentials for trade execution",
         )
     )
@@ -597,7 +622,8 @@ def get_user_selections():
         "deep_thinker": selected_deep_thinker,
         "google_thinking_level": thinking_level,
         "openai_reasoning_effort": reasoning_effort,
-        "risk_profile": risk_profile,
+        "code_agent_model": code_agent_model,
+        "horizons_enabled": horizons_enabled,
         "alpaca_api_key": alpaca_api_key,
         "alpaca_secret_key": alpaca_secret_key,
     }
@@ -642,23 +668,15 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     analyst_parts = []
     if final_state.get("market_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "market.md").write_text(final_state["market_report"])
-        analyst_parts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "sentiment.md").write_text(final_state["sentiment_report"])
-        analyst_parts.append(("Social Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "news.md").write_text(final_state["news_report"])
-        analyst_parts.append(("News Analyst", final_state["news_report"]))
+        market_pretty = _fmt_report_content(final_state["market_report"])
+        (analysts_dir / "market.md").write_text(market_pretty)
+        analyst_parts.append(("Market Analyst", market_pretty))
     if final_state.get("fundamentals_report"):
         analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(
-            final_state["fundamentals_report"]
-        )
+        fund_pretty = _fmt_report_content(final_state["fundamentals_report"])
+        (analysts_dir / "fundamentals.md").write_text(fund_pretty)
         analyst_parts.append(
-            ("Fundamentals Analyst", final_state["fundamentals_report"])
+            ("Fundamentals Analyst", fund_pretty)
         )
     if analyst_parts:
         content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
@@ -693,10 +711,6 @@ def display_complete_report(final_state):
     analysts = []
     if final_state.get("market_report"):
         analysts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        analysts.append(("Social Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        analysts.append(("News Analyst", final_state["news_report"]))
     if final_state.get("fundamentals_report"):
         analysts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
     if analysts:
@@ -706,7 +720,10 @@ def display_complete_report(final_state):
         for title, content in analysts:
             console.print(
                 Panel(
-                    Markdown(content), title=title, border_style="blue", padding=(1, 2)
+                    Markdown(_fmt_report_content(content)),
+                    title=title,
+                    border_style="blue",
+                    padding=(1, 2),
                 )
             )
 
@@ -731,16 +748,13 @@ def display_complete_report(final_state):
 
 
 # Ordered list of analysts for status transitions
-ANALYST_ORDER = ["market", "news", "fundamentals"]
+ANALYST_ORDER = ["market", "fundamentals"]
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
-    "news": "News Analyst",
     "fundamentals": "Fundamentals Analyst",
 }
 ANALYST_REPORT_MAP = {
     "market": "market_report",
-    "social": "sentiment_report",
-    "news": "news_report",
     "fundamentals": "fundamentals_report",
 }
 
@@ -874,10 +888,12 @@ def run_analysis():
         run_multi_analysis(selections)
         return
 
-    # Create config with selected research depth
+    # Create config with user selections
     config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = selections["research_depth"]
-    config["max_risk_discuss_rounds"] = selections["research_depth"]
+    depth_map = {1: "shallow", 3: "medium", 5: "deep"}
+    config["research_depth"] = depth_map.get(
+        selections["research_depth"], "shallow"
+    )
     config["quick_think_llm"] = selections["shallow_thinker"]
     config["deep_think_llm"] = selections["deep_thinker"]
     config["backend_url"] = selections["backend_url"]
@@ -885,7 +901,14 @@ def run_analysis():
     # Provider-specific thinking configuration
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
-
+    # Code agent
+    config["code_agent_model"] = selections.get("code_agent_model", "qwen2.5-coder:32b")
+    cbu = selections.get("code_agent_base_url", "")
+    config["code_agent_base_url"] = cbu if cbu else selections.get("backend_url", "http://localhost:11434")
+    # Horizons
+    config["horizons_enabled"] = selections.get(
+        "horizons_enabled", ["long_term", "medium_term", "short_term"]
+    )
     user_risk_profile = selections.get("risk_profile")
     if user_risk_profile is not None:
         user_risk_profile = user_risk_profile.model_dump()
@@ -1139,9 +1162,7 @@ def run_analysis():
                 )
             else:
                 # Display proposed order parameters
-                import json as _json
-
-                params_display = _json.dumps(proposal["order_params"], indent=2)
+                params_display = json.dumps(proposal["order_params"], indent=2)
                 console.print(
                     Panel(
                         params_display,
@@ -1182,15 +1203,22 @@ def run_multi_analysis(selections):
 
     # Build config
     config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = selections["research_depth"]
-    config["max_risk_discuss_rounds"] = selections["research_depth"]
+    depth_map = {1: "shallow", 3: "medium", 5: "deep"}
+    config["research_depth"] = depth_map.get(
+        selections["research_depth"], "shallow"
+    )
     config["quick_think_llm"] = selections["shallow_thinker"]
     config["deep_think_llm"] = selections["deep_thinker"]
     config["backend_url"] = selections["backend_url"]
     config["llm_provider"] = selections["llm_provider"].lower()
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
-
+    config["code_agent_model"] = selections.get("code_agent_model", "qwen2.5-coder:32b")
+    cbu = selections.get("code_agent_base_url", "")
+    config["code_agent_base_url"] = cbu if cbu else selections.get("backend_url", "http://localhost:11434")
+    config["horizons_enabled"] = selections.get(
+        "horizons_enabled", ["long_term", "medium_term", "short_term"]
+    )
     user_risk_profile = selections.get("risk_profile")
     if user_risk_profile is not None:
         user_risk_profile = user_risk_profile.model_dump()
@@ -1526,14 +1554,6 @@ def run_multi_analysis(selections):
             )
             if buf.agent_status.get("Trader") != "completed":
                 buf.update_agent_status("Trader", "completed")
-                for agent in [
-                    "Aggressive Analyst",
-                    "Conservative Analyst",
-                    "Neutral Analyst",
-                    "Portfolio Manager",
-                ]:
-                    if agent in buf.agent_status:
-                        buf.update_agent_status(agent, "completed")
 
     # Run parallel research with live display
     layout = create_multi_detail_layout()

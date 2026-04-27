@@ -31,7 +31,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "news", "fundamentals"],
+        selected_analysts=["market", "fundamentals"],
         risk_profile=None,
         debug=False,
         config: Dict[str, Any] = None,
@@ -92,7 +92,6 @@ class TradingAgentsGraph:
         # Maps analyst key -> CodeValidationAgent type string
         _analyst_type_map = {
             "market": "market",
-            "news": "news",
             "fundamentals": "fundamental",
         }
         self.code_agents = {}
@@ -112,14 +111,14 @@ class TradingAgentsGraph:
         self.graph_setup = GraphSetup(
             reasoning_llm=self.deep_thinking_llm,
             code_agents=self.code_agents,
-            trader_memory=self.trader_memory,
             quick_thinking_llm=self.quick_thinking_llm,
             research_depth=self.config.get("research_depth", "medium"),
+            horizons=tuple(self.config.get("horizons_enabled", ["long_term", "medium_term", "short_term"])),
         )
 
         self.propagator = Propagator()
         self.reflector = Reflector(self.quick_thinking_llm)
-        self.signal_processor = SignalProcessor(self.quick_thinking_llm)
+        self.signal_processor = SignalProcessor()
 
         # State tracking
         self.curr_state = None
@@ -186,14 +185,7 @@ class TradingAgentsGraph:
 
         # Return decision and processed signal
         composite = final_state.get("composite_signal", "")
-        decision = "HOLD"
-        if composite:
-            try:
-                from src.agents.utils.schemas import CompositeSignal
-                cs = CompositeSignal.model_validate_json(composite)
-                decision = "BUY" if cs.mu_final > 0.05 else "SELL" if cs.mu_final < -0.05 else "HOLD"
-            except Exception:
-                pass
+        decision = SignalProcessor.process_signal(composite)
         return final_state, decision
 
     def propose_trade(
@@ -280,7 +272,9 @@ class TradingAgentsGraph:
                         results[ticker] = {"error": str(e)}
 
         # Compute cross-ticker covariance matrix
-        covariance = self.compute_multi_ticker_covariance(results)
+        covariance = SignalProcessor.compute_multi_ticker_covariance(
+            results, self.config.get("cross_ticker_correlation", 0.3)
+        )
         for ticker, state in results.items():
             if "error" not in state:
                 state["_covariance_matrix"] = covariance
@@ -350,7 +344,9 @@ class TradingAgentsGraph:
                         results[ticker] = {"error": str(e)}
 
         # Compute cross-ticker covariance matrix
-        covariance = self.compute_multi_ticker_covariance(results)
+        covariance = SignalProcessor.compute_multi_ticker_covariance(
+            results, self.config.get("cross_ticker_correlation", 0.3)
+        )
         for ticker, state in results.items():
             if "error" not in state:
                 state["_covariance_matrix"] = covariance
@@ -438,8 +434,6 @@ class TradingAgentsGraph:
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "market_report": final_state.get("market_report", ""),
-            "sentiment_report": final_state.get("sentiment_report", ""),
-            "news_report": final_state.get("news_report", ""),
             "fundamentals_report": final_state.get("fundamentals_report", ""),
             "composite_signal": final_state.get("composite_signal", ""),
         }
@@ -459,61 +453,6 @@ class TradingAgentsGraph:
         self.reflector.reflect_trader(
             self.curr_state, returns_losses, self.trader_memory
         )
-
-    def compute_multi_ticker_covariance(
-        self, analysis_results: Dict[str, Dict]
-    ) -> Dict[str, Any]:
-        """Compute cross-asset covariance matrix from composite signals.
-
-        Uses a single-factor model with a configurable default correlation
-        of 0.3 between different tickers.
-
-        Returns dict with:
-          - tickers: List[str]
-          - covariance_matrix: List[List[float]]  # n x n
-          - annualized_volatilities: Dict[str, float]
-        """
-        from src.agents.utils.schemas import CompositeSignal
-
-        tickers = []
-        vols: Dict[str, float] = {}
-
-        for ticker, state in analysis_results.items():
-            if "error" in state:
-                continue
-            raw = state.get("composite_signal", "")
-            if not raw:
-                continue
-            try:
-                cs = CompositeSignal.model_validate_json(raw)
-                tickers.append(ticker)
-                vols[ticker] = max(0.001, cs.sigma_final)
-            except Exception:
-                continue
-
-        n = len(tickers)
-        if n == 0:
-            return {
-                "tickers": [],
-                "covariance_matrix": [],
-                "annualized_volatilities": {},
-            }
-
-        rho = self.config.get("cross_ticker_correlation", 0.3)
-        cov = [[0.0] * n for _ in range(n)]
-
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    cov[i][j] = vols[tickers[i]] ** 2
-                else:
-                    cov[i][j] = rho * vols[tickers[i]] * vols[tickers[j]]
-
-        return {
-            "tickers": tickers,
-            "covariance_matrix": cov,
-            "annualized_volatilities": vols,
-        }
 
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""

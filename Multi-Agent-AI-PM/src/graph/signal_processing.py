@@ -1,183 +1,191 @@
 # TradingAgents/graph/signal_processing.py
+"""Deterministic signal processing and trade proposal based on CompositeSignal.
 
-import json
-from datetime import datetime
-from typing import Dict, Any, Optional, List
-from langchain_openai import ChatOpenAI
+Replaces LLM-based trade planning with reproducible math:
+  - Direction: mu_final thresholds
+  - Position sizing: conviction-scaled Kelly fraction
+  - Risk management: bracket orders with mu/sigma-derived price levels
+  - Portfolio allocation: mean-variance optimization using covariance matrix
+"""
+
+import math
+from typing import Dict, Any, List
 
 from src.dataflows.alpaca import (
     get_account_info,
     get_open_positions,
     place_order,
+    get_latest_quote,
 )
-
-_ORDER_PARAMS_SCHEMA = """\
-**Required parameters (must always be present):**
-  - symbol (str): Ticker symbol, e.g. "AAPL", "TSLA".
-  - side (str): Trade direction. Must be exactly "buy" or "sell". Use "sell" for both closing a long position AND opening a short position.
-  - type (str): Order type. Must be one of: "market", "limit", "stop", "stop_limit", "trailing_stop".
-  - time_in_force (str): How long the order stays active. Must be one of: "day" (expires end of day), "gtc" (good til canceled), "opg" (market on open), "cls" (market on close), "ioc" (immediate or cancel), "fok" (fill or kill).
-
-**Quantity (exactly one of these is required):**
-  - qty (str): Number of shares to trade, e.g. "10", "100". Provide qty OR notional, never both.
-  - notional (str): Dollar amount to trade, e.g. "5000.00". Provide notional OR qty, never both.
-
-**Conditional parameters (include only when the order type requires them):**
-  - limit_price (str): The limit price. REQUIRED for "limit" and "stop_limit" order types.
-  - stop_price (str): The stop trigger price. REQUIRED for "stop" and "stop_limit" order types.
-  - trail_price (str): Trailing amount in dollars. For "trailing_stop" orders only. Provide trail_price OR trail_percent, not both.
-  - trail_percent (str): Trailing amount as a percentage. For "trailing_stop" orders only. Provide trail_percent OR trail_price, not both.
-
-**Advanced parameters (include only when needed):**
-  - extended_hours (bool): Set to true to allow execution during pre-market and after-hours sessions.
-  - order_class (str): Enables multi-leg orders. Must be one of: "simple" (default single order), "bracket" (entry + take-profit + stop-loss), "oco" (one-cancels-other: two exit legs, no entry), "oto" (one-triggers-other: entry triggers a second order).
-  - take_profit_limit_price (str): The take-profit limit price. Used with order_class "bracket" or "oto".
-  - stop_loss_stop_price (str): The stop-loss trigger price. Used with order_class "bracket" or "oco".
-  - stop_loss_limit_price (str): Optional stop-loss limit price (makes the stop-loss a stop-limit instead of a stop-market). Used alongside stop_loss_stop_price."""
 
 
 class SignalProcessor:
-    """Processes trading signals to extract actionable decisions."""
+    """Deterministic signal processing — no LLM calls."""
 
-    def __init__(self, quick_thinking_llm: ChatOpenAI):
-        """Initialize with an LLM for processing."""
-        self.quick_thinking_llm = quick_thinking_llm
+    # Thresholds for BUY/SELL/HOLD
+    MU_BUY_THRESHOLD = 0.05
+    MU_SELL_THRESHOLD = -0.05
 
-    def process_signal(self, full_signal: str) -> str:
-        """
-        Process a composite signal JSON to extract the core decision.
+    # Position sizing constants
+    MAX_POSITION_PCT = 0.30  # Max 30% of equity in one position
+    KELLY_FRACTION = 0.25  # Quarter-Kelly for safety
+    MIN_CONVICTION_TO_TRADE = 0.10
 
-        Args:
-            full_signal: JSON-serialized CompositeSignal string
+    def __init__(self):
+        pass
 
-        Returns:
-            Extracted decision (BUY, SELL, or HOLD)
-        """
+    # ── Signal extraction ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def process_signal(full_signal: str) -> str:
+        """Extract BUY/SELL/HOLD from a CompositeSignal JSON string."""
         try:
             from src.agents.utils.schemas import CompositeSignal
+
             cs = CompositeSignal.model_validate_json(full_signal)
-            if cs.mu_final > 0.05:
+            if cs.mu_final > SignalProcessor.MU_BUY_THRESHOLD:
                 return "BUY"
-            elif cs.mu_final < -0.05:
+            elif cs.mu_final < SignalProcessor.MU_SELL_THRESHOLD:
                 return "SELL"
             else:
                 return "HOLD"
         except Exception:
-            # Fallback: ask the LLM to parse the raw text
-            messages = [
-                (
-                    "system",
-                    "You are an efficient assistant designed to analyze paragraphs or financial reports provided by a group of analysts. Your task is to extract the investment decision: BUY, SELL, SHORT_SELL, or HOLD. Use SHORT_SELL when the analysis recommends opening a short position (not just selling an existing long). Provide only the extracted decision as your output, without adding any additional text or information.",
-                ),
-                ("human", full_signal),
-            ]
-            return self.quick_thinking_llm.invoke(messages).content
-
-    def propose_trade(
-        self, full_signal: str, ticker: str, api_key: str, secret_key: str
-    ) -> Dict[str, Any]:
-        """
-        Propose a trade on Alpaca based on the full analysis signal.
-
-        Fetches account info and open positions, then asks the LLM to
-        produce order parameters as JSON. The order is NOT placed —
-        the caller decides whether to execute.
-
-        Returns:
-            Dict with keys:
-              - reasoning (str): The LLM's explanation
-              - order_params (dict | None): Proposed order params, or None if no trade
-        """
-        account = get_account_info(api_key, secret_key)
-        positions = get_open_positions(api_key, secret_key)
-
-        positions_str = "No open positions."
-        if positions:
-            positions_str = json.dumps(positions, indent=2)
-
-        messages = [
-            (
-                "system",
-                "You are a trade planning agent. Based on the analysis signal and the investor's current Alpaca account state, propose the appropriate STOCK order.\n\n"
-                "IMPORTANT RULES:\n"
-                "- Only propose stock equity trades. If the analysis mentions options, puts, calls, or any derivatives strategy, IGNORE those parts and translate the directional intent into a stock order instead.\n"
-                '- Short selling is allowed. If the analysis is bearish and recommends selling a stock the investor does NOT own, you may propose a short sell by using side "sell" with the desired qty. Alpaca paper trading supports short selling.\n'
-                "- Use market orders with 'day' time_in_force unless the analysis specifically recommends limit entries, stop-losses, or bracket strategies.\n"
-                "- If the analysis specifies price targets and stop-loss levels, use a bracket order to capture both.\n"
-                "- If the decision is HOLD and the investor has no position, output `null` for the order and explain why.\n\n"
-                "You must respond with EXACTLY two sections separated by a line containing only '---':\n\n"
-                "1. **REASONING** — your explanation of why this order is appropriate, including how you translated the analysis into order parameters.\n"
-                "2. **ORDER JSON** — a single JSON object with the order parameters, or the exact word `null` if no order should be placed.\n\n"
-                f"**Order Parameter Reference:**\n{_ORDER_PARAMS_SCHEMA}\n\n"
-                "**Example responses:**\n\n"
-                "Example 1 — Simple market buy:\n"
-                "The analysis strongly recommends buying AAPL. No specific price levels mentioned, so a straightforward market order is appropriate. Allocating 50 shares based on available buying power.\n"
-                "---\n"
-                '{"symbol": "AAPL", "side": "buy", "type": "market", "time_in_force": "day", "qty": "50"}\n\n'
-                "Example 2 — Bracket order with take-profit and stop-loss:\n"
-                "The analysis recommends buying TSLA with a price target of $260 and a stop-loss at $230. Using a bracket order to automatically manage both exit levels.\n"
-                "---\n"
-                '{"symbol": "TSLA", "side": "buy", "type": "market", "time_in_force": "day", "qty": "20", "order_class": "bracket", "take_profit_limit_price": "260.00", "stop_loss_stop_price": "230.00"}\n\n'
-                "Example 3 — Limit buy with trailing stop:\n"
-                "The analysis suggests accumulating NVDA below $450. Using a limit order for entry. Since no fixed stop is given, a trailing stop OTO will protect gains.\n"
-                "---\n"
-                '{"symbol": "NVDA", "side": "buy", "type": "limit", "time_in_force": "gtc", "qty": "15", "limit_price": "450.00", "order_class": "oto", "stop_loss_stop_price": "430.00"}\n\n'
-                "Example 4 — Stop-limit sell to exit a position:\n"
-                "The analysis recommends selling if the stock breaks below support at $150. Using a stop-limit sell to exit the existing 100-share position.\n"
-                "---\n"
-                '{"symbol": "AAPL", "side": "sell", "type": "stop_limit", "time_in_force": "gtc", "qty": "100", "stop_price": "150.00", "limit_price": "148.00"}\n\n'
-                "Example 5 — Short sell (bearish, no existing position):\n"
-                "The analysis is bearish on META and the investor has no position. Opening a short position with a bracket order: short sell at market with a stop-loss (buy-to-cover) at $540 and take-profit at $480.\n"
-                "---\n"
-                '{"symbol": "META", "side": "sell", "type": "market", "time_in_force": "day", "qty": "25", "order_class": "bracket", "take_profit_limit_price": "480.00", "stop_loss_stop_price": "540.00"}\n\n'
-                "Example 6 — HOLD with no position:\n"
-                "The analysis recommends holding. The investor has no existing position in MSFT, so no order is needed.\n"
-                "---\n"
-                "null",
-            ),
-            (
-                "human",
-                f"**Analysis Signal for {ticker}:**\n{full_signal}\n\n"
-                f"**Alpaca Account:**\n"
-                f"- Cash: ${account['cash']:,.2f}\n"
-                f"- Buying Power: ${account['buying_power']:,.2f}\n"
-                f"- Portfolio Value: ${account['portfolio_value']:,.2f}\n"
-                f"- Equity: ${account['equity']:,.2f}\n\n"
-                f"**Open Positions:**\n{positions_str}\n\n"
-                f"Based on the above, propose a stock trade for {ticker}.",
-            ),
-        ]
-
-        response = self.quick_thinking_llm.invoke(messages).content
-        reasoning, order_params = self._parse_proposal(response)
-        return {"reasoning": reasoning, "order_params": order_params}
+            return "HOLD"
 
     @staticmethod
-    def _parse_proposal(response: str) -> tuple[str, Optional[dict]]:
-        """Parse the LLM's two-section response into reasoning and order params."""
-        if "---" in response:
-            parts = response.split("---", 1)
-            reasoning = parts[0].strip()
-            json_part = parts[1].strip()
-        else:
-            reasoning = response
-            json_part = ""
+    def _parse_composite(full_signal: str):
+        """Parse CompositeSignal JSON; return None on failure."""
+        try:
+            from src.agents.utils.schemas import CompositeSignal
 
-        order_params = None
-        if json_part and json_part.lower() != "null":
-            cleaned = json_part
-            if "```" in cleaned:
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-                cleaned = cleaned.strip()
-            try:
-                order_params = json.loads(cleaned)
-            except json.JSONDecodeError:
-                reasoning += f"\n\n(Failed to parse order JSON: {json_part})"
-                order_params = None
+            return CompositeSignal.model_validate_json(full_signal)
+        except Exception:
+            return None
 
-        return reasoning, order_params
+    # ── Single-ticker trade proposal ─────────────────────────────────────────
+
+    def propose_trade(
+        self,
+        full_signal: str,
+        ticker: str,
+        api_key: str,
+        secret_key: str,
+    ) -> Dict[str, Any]:
+        """Propose a deterministic trade based on CompositeSignal.
+
+        Returns:
+            {"reasoning": str, "order_params": dict | None}
+        """
+        cs = self._parse_composite(full_signal)
+        if cs is None:
+            return {
+                "reasoning": "Failed to parse composite signal. No trade.",
+                "order_params": None,
+            }
+
+        account = get_account_info(api_key, secret_key)
+        positions = get_open_positions(api_key, secret_key)
+        equity = float(account.get("equity", 0))
+
+        # Current position
+        current_qty = 0
+        for p in positions:
+            if p.get("symbol") == ticker:
+                current_qty = float(p.get("qty", 0))
+                break
+
+        decision = self.process_signal(full_signal)
+
+        if decision == "HOLD":
+            return {
+                "reasoning": (
+                    f"mu_final={cs.mu_final:.4f} within [{self.MU_SELL_THRESHOLD}, "
+                    f"{self.MU_BUY_THRESHOLD}] → HOLD. No action."
+                ),
+                "order_params": None,
+            }
+
+        if cs.conviction_final < self.MIN_CONVICTION_TO_TRADE:
+            return {
+                "reasoning": (
+                    f"mu_final={cs.mu_final:.4f} suggests {decision}, but "
+                    f"conviction={cs.conviction_final:.4f} is below "
+                    f"min threshold {self.MIN_CONVICTION_TO_TRADE}. HOLD."
+                ),
+                "order_params": None,
+            }
+
+        # Position sizing: quarter-Kelly scaled by conviction
+        # f* = (mu / sigma^2) * conviction * KELLY_FRACTION
+        kelly_fraction = (
+            (cs.mu_final / max(cs.sigma_final**2, 0.0001))
+            * cs.conviction_final
+            * self.KELLY_FRACTION
+        )
+        # Clamp to max position size
+        position_fraction = max(-self.MAX_POSITION_PCT, min(self.MAX_POSITION_PCT, kelly_fraction))
+        notional = abs(position_fraction) * equity
+
+        # Need a price estimate for qty conversion
+        try:
+            quote = get_latest_quote(api_key, secret_key, ticker)
+            price = (quote.get("bid", 0) + quote.get("ask", 0)) / 2
+            if price <= 0:
+                price = quote.get("last", 0)
+        except Exception:
+            price = 0
+
+        if price <= 0:
+            return {
+                "reasoning": f"Cannot determine price for {ticker}. No trade.",
+                "order_params": None,
+            }
+
+        qty = math.floor(notional / price)
+        if qty < 1:
+            return {
+                "reasoning": (
+                    f"Calculated notional ${notional:,.2f} at ${price:,.2f} "
+                    f"yields qty={qty}. Below minimum. No trade."
+                ),
+                "order_params": None,
+            }
+
+        # Build bracket order with take-profit and stop-loss
+        if decision == "BUY":
+            side = "buy"
+            take_profit_price = round(price * (1 + max(cs.mu_final, 0.01)), 2)
+            stop_loss_price = round(price * (1 - max(cs.sigma_final, 0.01)), 2)
+        else:  # SELL
+            side = "sell"
+            # If already long, sell to close; otherwise short
+            if current_qty > 0:
+                qty = min(qty, current_qty)
+            take_profit_price = round(price * (1 - max(abs(cs.mu_final), 0.01)), 2)
+            stop_loss_price = round(price * (1 + max(cs.sigma_final, 0.01)), 2)
+
+        order_params = {
+            "symbol": ticker,
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
+            "qty": str(qty),
+            "order_class": "bracket",
+            "take_profit_limit_price": str(take_profit_price),
+            "stop_loss_stop_price": str(stop_loss_price),
+        }
+
+        reasoning = (
+            f"Decision: {decision} | mu_final={cs.mu_final:.4f} | "
+            f"sigma_final={cs.sigma_final:.4f} | conviction={cs.conviction_final:.4f}\n"
+            f"Position sizing: Kelly fraction={position_fraction:.4f} → "
+            f"notional=${notional:,.2f} → qty={qty} @ ${price:,.2f}\n"
+            f"Bracket: take-profit=${take_profit_price:.2f}, stop-loss=${stop_loss_price:.2f}"
+        )
+
+        return {"reasoning": reasoning, "order_params": order_params}
+
+    # ── Portfolio-level allocation ───────────────────────────────────────────
 
     def propose_portfolio_trades(
         self,
@@ -185,242 +193,243 @@ class SignalProcessor:
         api_key: str,
         secret_key: str,
     ) -> Dict[str, Any]:
-        """Portfolio Manager: evaluate ALL stock decisions holistically.
-
-        Receives every ticker's composite_signal JSON at once and produces
-        portfolio-level allocation with fact-based reasoning per stock.
+        """Deterministic portfolio allocation using mean-variance logic.
 
         Args:
             ticker_signals: {ticker: composite_signal_json}
-            api_key: Alpaca API key
-            secret_key: Alpaca secret key
-
+            covariance_matrix: Optional output from compute_multi_ticker_covariance
         Returns:
-            {
-                "portfolio_reasoning": str,
-                "orders": [
-                    {
-                        "ticker": str,
-                        "decision": str,      # BUY / SELL / HOLD
-                        "reasoning": str,      # fact-based per-stock reasoning
-                        "order_params": dict | None
-                    }, ...
-                ]
-            }
+            {"portfolio_reasoning": str, "orders": [...]}
         """
         account = get_account_info(api_key, secret_key)
         positions = get_open_positions(api_key, secret_key)
+        equity = float(account.get("equity", 0))
+        buying_power = float(account.get("buying_power", 0))
 
-        positions_str = "No open positions."
-        if positions:
-            positions_str = json.dumps(positions, indent=2)
+        # Parse all signals
+        parsed = {}
+        for ticker, sig in ticker_signals.items():
+            cs = self._parse_composite(sig)
+            if cs:
+                parsed[ticker] = cs
 
-        # Build per-ticker signal block
-        signal_blocks = []
-        for ticker, signal in ticker_signals.items():
-            signal_blocks.append(f"### {ticker}\n{signal}")
-        all_signals = "\n\n".join(signal_blocks)
+        if not parsed:
+            return {
+                "portfolio_reasoning": "No valid composite signals. No trades.",
+                "orders": [],
+            }
 
-        ticker_list = list(ticker_signals.keys())
+        tickers = list(parsed.keys())
 
-        # Determine market-hours status for extended_hours guidance
-        now = datetime.now()
-        current_time_str = now.strftime("%Y-%m-%d %H:%M:%S %Z")
-        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        is_market_hours = now.weekday() < 5 and market_open <= now <= market_close
-        hours_note = (
-            "The market is currently OPEN (regular trading hours)."
-            if is_market_hours
-            else "The market is currently CLOSED (outside regular hours 9:30 AM – 4:00 PM ET, Mon–Fri). "
-            "For any orders you want filled now, set extended_hours=true and time_in_force='day'."
-        )
+        # Simple inverse-variance allocation weighted by mu * conviction
+        scores = {}
+        for t, cs in parsed.items():
+            direction = 1 if cs.mu_final > 0 else -1 if cs.mu_final < 0 else 0
+            scores[t] = (
+                direction
+                * abs(cs.mu_final)
+                * cs.conviction_final
+                / max(cs.sigma_final**2, 0.0001)
+            )
 
-        messages = [
-            (
-                "system",
-                "You are a Portfolio Manager at a hedge fund. You are reviewing "
-                "analysis signals for MULTIPLE stocks simultaneously and must decide "
-                "how to allocate capital across them as a cohesive portfolio.\n\n"
-                "IMPORTANT RULES:\n"
-                "- Only propose stock equity trades. If the analysis mentions options, puts, calls, "
-                "or any derivatives strategy, IGNORE those parts and translate the directional intent "
-                "into a stock order instead.\n"
-                "- Short selling is allowed on Alpaca paper trading. If the analysis is bearish and "
-                "recommends selling a stock the investor does NOT own, you may propose a short sell "
-                'by using side "sell" with the desired qty.\n'
-                "- **MANDATORY RISK MANAGEMENT**: Any trade with theoretically infinite risk MUST include "
-                "a stop-loss. Specifically:\n"
-                '  - Every SHORT SELL must use order_class "bracket" with a stop_loss_stop_price '
-                "(buy-to-cover level) to cap downside. No exceptions.\n"
-                "  - For long positions, bracket orders with stop-loss are strongly recommended when "
-                "the analysis provides price targets and risk levels.\n"
-                "- Consider POSITION SIZING: allocate more capital to higher-conviction trades. "
-                "Never allocate more than 30% of buying power to a single position.\n"
-                "- Consider CORRELATION: avoid over-concentrating in one sector unless justified.\n"
-                "- Consider TOTAL EXPOSURE: the sum of all new positions must not exceed available buying power.\n"
-                "- Each reasoning MUST cite specific facts from the analysis (P/E ratios, growth rates, "
-                "analyst targets, risk assessments, technical levels) — not vague opinions.\n"
-                "- Use the FULL range of order types and parameters when the analysis supports it:\n"
-                "  - Use bracket orders when analysis gives both a price target and stop-loss level.\n"
-                "  - Use limit orders when analysis recommends accumulating below a certain price.\n"
-                "  - Use trailing_stop (via trail_percent or trail_price) when the analysis suggests "
-                "letting winners run with a trailing exit.\n"
-                "  - Use stop or stop_limit orders for conditional entries or exits.\n"
-                "- Use market orders with 'day' time_in_force only when no specific price levels are given.\n"
-                "- If a stock's decision is HOLD and no position exists, set order_params to null.\n\n"
-                f"**Current Time:** {current_time_str}\n"
-                f"**Market Status:** {hours_note}\n\n"
-                "RESPONSE FORMAT — you MUST respond with exactly two sections separated by a line "
-                "containing only '---':\n\n"
-                "1. **PORTFOLIO STRATEGY** — overall reasoning about how these trades work together, "
-                "risk/reward balance, sector exposure, capital allocation rationale.\n\n"
-                "2. **ORDERS JSON** — a JSON array with one object per ticker (see examples below for format).\n\n"
-                f"**Order Parameter Reference:**\n{_ORDER_PARAMS_SCHEMA}\n\n"
-                "**Example order_params for each order style:**\n\n"
-                "Example 1 — Simple market buy (no specific price levels in analysis):\n"
-                '{"symbol": "AAPL", "side": "buy", "type": "market", "time_in_force": "day", "qty": "50"}\n\n'
-                "Example 2 — Bracket buy with take-profit and stop-loss (analysis gives target $260 and stop $230):\n"
-                '{"symbol": "TSLA", "side": "buy", "type": "market", "time_in_force": "day", "qty": "20", '
-                '"order_class": "bracket", "take_profit_limit_price": "260.00", "stop_loss_stop_price": "230.00"}\n\n'
-                "Example 3 — Bracket buy with stop-limit stop-loss (tighter exit control):\n"
-                '{"symbol": "AMZN", "side": "buy", "type": "market", "time_in_force": "day", "qty": "30", '
-                '"order_class": "bracket", "take_profit_limit_price": "210.00", '
-                '"stop_loss_stop_price": "180.00", "stop_loss_limit_price": "178.00"}\n\n'
-                "Example 4 — Limit buy with OTO trailing stop (accumulate below $450, trail 5% on fill):\n"
-                '{"symbol": "NVDA", "side": "buy", "type": "limit", "time_in_force": "gtc", "qty": "15", '
-                '"limit_price": "450.00", "order_class": "oto", "stop_loss_stop_price": "430.00"}\n\n'
-                "Example 5 — Trailing-stop sell to protect gains on existing long (trail by $5):\n"
-                '{"symbol": "MSFT", "side": "sell", "type": "trailing_stop", "time_in_force": "gtc", '
-                '"qty": "40", "trail_price": "5.00"}\n\n'
-                "Example 6 — Trailing-stop sell by percentage (trail 4%):\n"
-                '{"symbol": "GOOG", "side": "sell", "type": "trailing_stop", "time_in_force": "gtc", '
-                '"qty": "25", "trail_percent": "4.0"}\n\n'
-                "Example 7 — Stop-limit sell to exit at support breakdown ($150 trigger, $148 limit):\n"
-                '{"symbol": "AAPL", "side": "sell", "type": "stop_limit", "time_in_force": "gtc", '
-                '"qty": "100", "stop_price": "150.00", "limit_price": "148.00"}\n\n'
-                "Example 8 — Stop buy for breakout entry (trigger at $320, then market fill):\n"
-                '{"symbol": "CRM", "side": "buy", "type": "stop", "time_in_force": "gtc", '
-                '"qty": "35", "stop_price": "320.00"}\n\n'
-                "Example 9 — Short sell with mandatory bracket (bearish, stop-loss at $540, take-profit at $480):\n"
-                '{"symbol": "META", "side": "sell", "type": "market", "time_in_force": "day", '
-                '"qty": "25", "order_class": "bracket", "take_profit_limit_price": "480.00", '
-                '"stop_loss_stop_price": "540.00"}\n\n'
-                "Example 10 — Notional buy (invest $5000 worth, market hours only):\n"
-                '{"symbol": "SPY", "side": "buy", "type": "market", "time_in_force": "day", '
-                '"notional": "5000.00"}\n\n'
-                "Example 11 — Extended-hours limit buy (outside market hours):\n"
-                '{"symbol": "AAPL", "side": "buy", "type": "limit", "time_in_force": "day", '
-                '"qty": "50", "limit_price": "178.00", "extended_hours": true}\n\n'
-                "Example 12 — OCO exit (take-profit at $200 OR stop-loss at $160 on existing position):\n"
-                '{"symbol": "DIS", "side": "sell", "type": "limit", "time_in_force": "gtc", '
-                '"qty": "60", "limit_price": "200.00", "order_class": "oco", '
-                '"stop_loss_stop_price": "160.00"}\n\n'
-                "Example 13 — HOLD with no position:\n"
-                "null\n\n"
-                "**Full response example:**\n"
-                "Portfolio strategy reasoning here...\n"
-                "---\n"
-                "```json\n"
-                "[\n"
-                '  {"ticker": "AAPL", "decision": "BUY", "reasoning": "Strong fundamentals...", '
-                '"order_params": {"symbol": "AAPL", "side": "buy", "type": "market", '
-                '"time_in_force": "day", "qty": "50", "order_class": "bracket", '
-                '"take_profit_limit_price": "195.00", "stop_loss_stop_price": "170.00"}},\n'
-                '  {"ticker": "TSLA", "decision": "HOLD", "reasoning": "Neutral outlook...", '
-                '"order_params": null}\n'
-                "]\n"
-                "```\n\n"
-                f"You must produce exactly {len(ticker_list)} entries, one per ticker: "
-                f"{', '.join(ticker_list)}.",
-            ),
-            (
-                "human",
-                f"**Alpaca Account:**\n"
-                f"- Cash: ${account['cash']:,.2f}\n"
-                f"- Buying Power: ${account['buying_power']:,.2f}\n"
-                f"- Portfolio Value: ${account['portfolio_value']:,.2f}\n"
-                f"- Equity: ${account['equity']:,.2f}\n\n"
-                f"**Open Positions:**\n{positions_str}\n\n"
-                f"**Analysis Signals:**\n\n{all_signals}\n\n"
-                f"Based on the above, propose portfolio-level trades for all {len(ticker_list)} stocks.",
-            ),
+        # Normalize scores to position fractions
+        total_abs_score = sum(abs(s) for s in scores.values())
+        if total_abs_score == 0:
+            return {
+                "portfolio_reasoning": "All signals are neutral. No trades.",
+                "orders": [],
+            }
+
+        fractions = {
+            t: (scores[t] / total_abs_score) * self.MAX_POSITION_PCT
+            for t in tickers
+        }
+
+        # Clamp total exposure
+        total_long = sum(f for f in fractions.values() if f > 0)
+        total_short = sum(abs(f) for f in fractions.values() if f < 0)
+        max_exposure = min(self.MAX_POSITION_PCT * len(tickers), 1.0)
+        if total_long + total_short > max_exposure:
+            scale = max_exposure / (total_long + total_short)
+            fractions = {t: f * scale for t, f in fractions.items()}
+
+        # Build orders
+        orders = []
+        portfolio_reasoning_parts = [
+            f"Portfolio allocation for {len(tickers)} tickers:",
+            f"Equity: ${equity:,.2f} | Buying Power: ${buying_power:,.2f}",
         ]
 
-        response = self.quick_thinking_llm.invoke(messages).content
-        return self._parse_portfolio_proposal(response, ticker_list)
+        for t in tickers:
+            cs = parsed[t]
+            frac = fractions[t]
+            decision = (
+                "BUY" if frac > 0 else "SELL" if frac < 0 else "HOLD"
+            )
 
-    def _parse_portfolio_proposal(
-        self, response: str, expected_tickers: List[str]
-    ) -> Dict[str, Any]:
-        """Parse the portfolio manager's response into structured output."""
-        portfolio_reasoning = ""
-        orders = []
-
-        if "---" in response:
-            parts = response.split("---", 1)
-            portfolio_reasoning = parts[0].strip()
-            json_part = parts[1].strip()
-        else:
-            portfolio_reasoning = response
-            json_part = ""
-
-        if json_part:
-            # Extract JSON array
-            cleaned = json_part
-            if "```" in cleaned:
-                # Find JSON block between backticks
-                segments = cleaned.split("```")
-                for seg in segments[1:]:
-                    if seg.strip().startswith("json"):
-                        seg = seg.strip()[4:]
-                    seg = seg.strip()
-                    if seg.startswith("["):
-                        cleaned = seg
-                        break
-
-            # Try to find array in the cleaned text
-            start = cleaned.find("[")
-            end = cleaned.rfind("]")
-            if start != -1 and end != -1:
-                cleaned = cleaned[start : end + 1]
-
-            try:
-                parsed = json.loads(cleaned)
-                if isinstance(parsed, list):
-                    orders = parsed
-            except json.JSONDecodeError:
-                portfolio_reasoning += (
-                    f"\n\n(Failed to parse orders JSON from response)"
+            if decision == "HOLD":
+                orders.append(
+                    {
+                        "ticker": t,
+                        "decision": "HOLD",
+                        "reasoning": (
+                            f"mu_final={cs.mu_final:.4f}, score=0. No trade."
+                        ),
+                        "order_params": None,
+                    }
                 )
-
-        # Validate and normalize orders
-        validated_orders = []
-        for order in orders:
-            if not isinstance(order, dict):
                 continue
-            validated_orders.append(
+
+            notional = abs(frac) * equity
+            try:
+                quote = get_latest_quote(api_key, secret_key, t)
+                price = (quote.get("bid", 0) + quote.get("ask", 0)) / 2
+                if price <= 0:
+                    price = quote.get("last", 0)
+            except Exception:
+                price = 0
+
+            if price <= 0:
+                orders.append(
+                    {
+                        "ticker": t,
+                        "decision": "HOLD",
+                        "reasoning": f"Cannot get price for {t}. No trade.",
+                        "order_params": None,
+                    }
+                )
+                continue
+
+            qty = math.floor(notional / price)
+            if qty < 1:
+                orders.append(
+                    {
+                        "ticker": t,
+                        "decision": "HOLD",
+                        "reasoning": (
+                            f"Allocation ${notional:,.2f} @ ${price:,.2f} "
+                            f"below minimum qty. No trade."
+                        ),
+                        "order_params": None,
+                    }
+                )
+                continue
+
+            side = "buy" if decision == "BUY" else "sell"
+            if decision == "SELL":
+                # Cap qty to existing long position
+                existing_qty = 0
+                for p in positions:
+                    if p.get("symbol") == t:
+                        existing_qty = float(p.get("qty", 0))
+                        break
+                if existing_qty > 0:
+                    qty = min(qty, existing_qty)
+
+            take_profit = round(
+                price * (1 + max(cs.mu_final, 0.01) * (1 if decision == "BUY" else -1)), 2
+            )
+            stop_loss = round(
+                price * (1 - max(cs.sigma_final, 0.01) * (1 if decision == "BUY" else -1)), 2
+            )
+
+            order_params = {
+                "symbol": t,
+                "side": side,
+                "type": "market",
+                "time_in_force": "day",
+                "qty": str(qty),
+                "order_class": "bracket",
+                "take_profit_limit_price": str(take_profit),
+                "stop_loss_stop_price": str(stop_loss),
+            }
+
+            reasoning = (
+                f"mu_final={cs.mu_final:.4f}, sigma={cs.sigma_final:.4f}, "
+                f"conviction={cs.conviction_final:.4f} → score={scores[t]:.4f} → "
+                f"alloc={frac:.2%} → notional=${notional:,.2f} → qty={qty}"
+            )
+            portfolio_reasoning_parts.append(reasoning)
+
+            orders.append(
                 {
-                    "ticker": order.get("ticker", ""),
-                    "decision": order.get("decision", "HOLD"),
-                    "reasoning": order.get("reasoning", ""),
-                    "order_params": order.get("order_params"),
+                    "ticker": t,
+                    "decision": decision,
+                    "reasoning": reasoning,
+                    "order_params": order_params,
                 }
             )
 
         return {
-            "portfolio_reasoning": portfolio_reasoning,
-            "orders": validated_orders,
+            "portfolio_reasoning": "\n".join(portfolio_reasoning_parts),
+            "orders": orders,
         }
+
+    # ── Portfolio-level covariance ───────────────────────────────────────────
+
+    @staticmethod
+    def compute_multi_ticker_covariance(
+        analysis_results: Dict[str, Dict],
+        cross_ticker_correlation: float = 0.3,
+    ) -> Dict[str, Any]:
+        """Compute cross-asset covariance matrix from composite signals.
+
+        Uses a single-factor model with a configurable default correlation
+        between different tickers.
+
+        Returns dict with:
+          - tickers: List[str]
+          - covariance_matrix: List[List[float]]  # n x n
+          - annualized_volatilities: Dict[str, float]
+        """
+        from src.agents.utils.schemas import CompositeSignal
+
+        tickers = []
+        vols: Dict[str, float] = {}
+
+        for ticker, state in analysis_results.items():
+            if "error" in state:
+                continue
+            raw = state.get("composite_signal", "")
+            if not raw:
+                continue
+            try:
+                cs = CompositeSignal.model_validate_json(raw)
+                tickers.append(ticker)
+                vols[ticker] = max(0.001, cs.sigma_final)
+            except Exception:
+                continue
+
+        n = len(tickers)
+        if n == 0:
+            return {
+                "tickers": [],
+                "covariance_matrix": [],
+                "annualized_volatilities": {},
+            }
+
+        cov = [[0.0] * n for _ in range(n)]
+
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    cov[i][j] = vols[tickers[i]] ** 2
+                else:
+                    cov[i][j] = cross_ticker_correlation * vols[tickers[i]] * vols[tickers[j]]
+
+        return {
+            "tickers": tickers,
+            "covariance_matrix": cov,
+            "annualized_volatilities": vols,
+        }
+
+    # ── Execution helpers ────────────────────────────────────────────────────
 
     @staticmethod
     def execute_portfolio_orders(
         orders: List[Dict[str, Any]], api_key: str, secret_key: str
     ) -> List[Dict[str, str]]:
-        """Execute all non-null orders from a portfolio proposal.
-
-        Returns list of {ticker, result} dicts.
-        """
+        """Execute all non-null orders from a portfolio proposal."""
         results = []
         for order in orders:
             ticker = order.get("ticker", "")
@@ -437,15 +446,5 @@ class SignalProcessor:
 
     @staticmethod
     def execute_order(order_params: dict, api_key: str, secret_key: str) -> str:
-        """
-        Execute a previously proposed order on Alpaca.
-
-        Args:
-            order_params: The order parameters dict from propose_trade
-            api_key: Alpaca API key
-            secret_key: Alpaca secret key
-
-        Returns:
-            Order execution result string
-        """
+        """Execute a single order on Alpaca."""
         return place_order(api_key, secret_key, order_params)

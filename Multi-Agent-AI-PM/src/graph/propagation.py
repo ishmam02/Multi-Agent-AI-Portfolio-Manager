@@ -23,9 +23,6 @@ class Propagator:
             "trade_date": str(trade_date),
             "market_report": "",
             "fundamentals_report": "",
-            "sentiment_report": "",
-            "news_report": "",
-            "pm_prompt": "",
             "composite_signal": "",
         }
         if risk_profile is not None:

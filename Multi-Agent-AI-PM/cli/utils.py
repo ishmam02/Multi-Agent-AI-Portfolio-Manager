@@ -9,8 +9,6 @@ console = Console()
 
 ANALYST_ORDER = [
     ("Market Analyst", AnalystType.MARKET),
-    ("Social Media Analyst", AnalystType.SOCIAL),
-    ("News Analyst", AnalystType.NEWS),
     ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
 ]
 
@@ -101,9 +99,9 @@ def select_research_depth() -> int:
 
     # Define research depth options with their corresponding values
     DEPTH_OPTIONS = [
-        ("Shallow - Quick research, few debate and strategy discussion rounds", 1),
-        ("Medium - Middle ground, moderate debate rounds and strategy discussion", 3),
-        ("Deep - Comprehensive research, in depth debate and strategy discussion", 5),
+        ("Shallow - Quick research with limited indicator coverage", 1),
+        ("Medium - Balanced research depth and indicator coverage", 3),
+        ("Deep - Comprehensive research with full indicator coverage", 5),
     ]
 
     choice = questionary.select(
@@ -174,7 +172,7 @@ def select_shallow_thinking_agent(provider) -> str:
             ("Z.AI GLM 4.5 Air (free)", "z-ai/glm-4.5-air:free"),
         ],
         "ollama": [
-            ("Kimi-k2 (cloud)", "kimi-k2:1t-cloud"),
+            ("Minimax-m2.7", "minimax-m2.7:cloud"),
             ("Kimi-k2-thinking (cloud)", "kimi-k2-thinking:cloud"),
             ("Kimi-k2.5 (cloud)", "kimi-k2.5:cloud"),
             ("Llama3.1:8b (8B, local)", "llama3.1:8b"),
@@ -261,7 +259,7 @@ def select_deep_thinking_agent(provider) -> str:
             ),
         ],
         "ollama": [
-            ("Kimi-k2 (cloud)", "kimi-k2:1t-cloud"),
+            ("Minimax-m2.7", "minimax-m2.7:cloud"),
             ("Kimi-k2-thinking (cloud)", "kimi-k2-thinking:cloud"),
             ("Kimi-k2.5 (cloud)", "kimi-k2.5:cloud"),
             ("Qwen2.5:7b (7B, local)", "qwen2.5:7b"),
@@ -581,6 +579,188 @@ def ask_alpaca_credentials() -> tuple[str, str]:
     return api_key.strip(), secret_key.strip()
 
 
+def select_code_agent_model(provider: str) -> str:
+    """Select code-agent LLM using the same provider-then-model pattern as thinking agents."""
+    # Re-use the shallow-thinker options — code agents are fast/cheap models
+    SHALLOW_AGENT_OPTIONS = {
+        "openai": [
+            ("GPT-5 Mini - Cost-optimized reasoning", "gpt-5-mini"),
+            ("GPT-5 Nano - Ultra-fast, high-throughput", "gpt-5-nano"),
+            ("GPT-5.2 - Latest flagship", "gpt-5.2"),
+            ("GPT-5.1 - Flexible reasoning", "gpt-5.1"),
+            ("GPT-4.1 - Smartest non-reasoning, 1M context", "gpt-4.1"),
+        ],
+        "anthropic": [
+            ("Claude Haiku 4.5 - Fast + extended thinking", "claude-haiku-4-5"),
+            ("Claude Sonnet 4.5 - Best for agents/coding", "claude-sonnet-4-5"),
+            ("Claude Sonnet 4 - High-performance", "claude-sonnet-4-20250514"),
+        ],
+        "google": [
+            ("Gemini 3 Flash - Next-gen fast", "gemini-3-flash-preview"),
+            ("Gemini 2.5 Flash - Balanced, recommended", "gemini-2.5-flash"),
+            ("Gemini 3 Pro - Reasoning-first", "gemini-3-pro-preview"),
+            ("Gemini 2.5 Flash Lite - Fast, low-cost", "gemini-2.5-flash-lite"),
+        ],
+        "xai": [
+            (
+                "Grok 4.1 Fast (Non-Reasoning) - Speed optimized, 2M ctx",
+                "grok-4-1-fast-non-reasoning",
+            ),
+            (
+                "Grok 4 Fast (Non-Reasoning) - Speed optimized",
+                "grok-4-fast-non-reasoning",
+            ),
+            (
+                "Grok 4.1 Fast (Reasoning) - High-performance, 2M ctx",
+                "grok-4-1-fast-reasoning",
+            ),
+            ("Grok 4 Fast (Reasoning) - High-performance", "grok-4-fast-reasoning"),
+        ],
+        "openrouter": [
+            (
+                "NVIDIA Nemotron 3 Nano 30B (free)",
+                "nvidia/nemotron-3-nano-30b-a3b:free",
+            ),
+            ("Z.AI GLM 4.5 Air (free)", "z-ai/glm-4.5-air:free"),
+        ],
+        "ollama": [
+            ("Minimax-m2.7", "minimax-m2.7:cloud"),
+            ("Kimi-k2-thinking (cloud)", "kimi-k2-thinking:cloud"),
+            ("Kimi-k2.5 (cloud)", "kimi-k2.5:cloud"),
+            ("Llama3.1:8b (8B, local)", "llama3.1:8b"),
+            ("Qwen2.5:7b (7B, local)", "qwen2.5:7b"),
+            ("Qwen2.5:1.5b (1.5B, local)", "qwen2.5:1.5b"),
+            ("Gemma3:1b (1B, local)", "gemma3:1b"),
+            ("Qwen3:latest (8B, local)", "qwen3:latest"),
+            ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
+            ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
+        ],
+    }
+
+    choice = questionary.select(
+        "Select Your [Code Agent LLM Engine]:",
+        choices=[
+            questionary.Choice(display, value=value)
+            for display, value in SHALLOW_AGENT_OPTIONS[provider.lower()]
+        ],
+        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        style=questionary.Style(
+            [
+                ("selected", "fg:magenta noinherit"),
+                ("highlighted", "fg:magenta noinherit"),
+                ("pointer", "fg:magenta noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if choice is None:
+        console.print("\n[red]No code agent model selected. Exiting...[/red]")
+        exit(1)
+
+    return choice
+
+
+def ask_horizons() -> List[str]:
+    """Prompt user to select which investment horizons to analyze."""
+    choices = questionary.checkbox(
+        "Select investment time horizons to analyze:",
+        choices=[
+            questionary.Choice("Long Term (1+ year)", value="long_term", checked=True),
+            questionary.Choice(
+                "Medium Term (3-12 months)", value="medium_term", checked=True
+            ),
+            questionary.Choice(
+                "Short Term (< 3 months)", value="short_term", checked=True
+            ),
+        ],
+        validate=lambda x: len(x) > 0 or "Select at least one horizon.",
+        style=questionary.Style(
+            [
+                ("checkbox-selected", "fg:green"),
+                ("selected", "fg:green noinherit"),
+                ("highlighted", "noinherit"),
+                ("pointer", "noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if not choices:
+        console.print("\n[red]No horizons selected. Exiting...[/red]")
+        exit(1)
+
+    return choices
+
+
+def ask_concurrency_limits() -> tuple[int, int, int]:
+    """Prompt for max concurrent tickers, rate limit RPM, and max retries."""
+    style = questionary.Style([("text", "fg:yellow"), ("highlighted", "noinherit")])
+
+    max_concurrent = questionary.text(
+        "Max concurrent tickers (portfolio mode):",
+        default="5",
+        validate=lambda x: (
+            x.strip().isdigit() and 1 <= int(x.strip()) <= 20 or "Enter 1-20."
+        ),
+        style=style,
+    ).ask()
+    if max_concurrent is None:
+        max_concurrent = "5"
+
+    rate_limit = questionary.text(
+        "Rate limit (requests per minute, 0=unlimited):",
+        default="60",
+        validate=lambda x: (
+            x.strip().isdigit() and 0 <= int(x.strip()) <= 1000 or "Enter 0-1000."
+        ),
+        style=style,
+    ).ask()
+    if rate_limit is None:
+        rate_limit = "60"
+
+    max_retries = questionary.text(
+        "Max retries on LLM failure:",
+        default="10",
+        validate=lambda x: (
+            x.strip().isdigit() and 0 <= int(x.strip()) <= 50 or "Enter 0-50."
+        ),
+        style=style,
+    ).ask()
+    if max_retries is None:
+        max_retries = "10"
+
+    return int(max_concurrent), int(rate_limit), int(max_retries)
+
+
+def ask_data_vendors() -> Dict[str, str]:
+    """Prompt for preferred data vendors."""
+    vendor = questionary.select(
+        "Preferred stock data vendor:",
+        choices=[
+            questionary.Choice("yfinance (free, recommended)", value="yfinance"),
+            questionary.Choice(
+                "Alpha Vantage (requires API key)", value="alpha_vantage"
+            ),
+        ],
+        style=questionary.Style(
+            [
+                ("selected", "fg:green noinherit"),
+                ("highlighted", "fg:green noinherit"),
+                ("pointer", "fg:green noinherit"),
+            ]
+        ),
+    ).ask()
+
+    if vendor is None:
+        vendor = "yfinance"
+
+    return {
+        "core_stock_apis": vendor,
+        "technical_indicators": vendor,
+        "fundamental_data": vendor,
+        "news_data": "alpaca",
+    }
+
+
 def select_analysis_mode() -> str:
     """Select between single stock analysis and portfolio discovery mode."""
     choice = questionary.select(
@@ -618,8 +798,9 @@ def get_num_picks() -> int:
         "How many stocks should the screener discover?",
         default="5",
         validate=lambda x: (
-            x.strip().isdigit() and 1 <= int(x.strip()) <= 20
-        ) or "Enter a number between 1 and 20.",
+            (x.strip().isdigit() and 1 <= int(x.strip()) <= 20)
+            or "Enter a number between 1 and 20."
+        ),
         style=questionary.Style(
             [
                 ("text", "fg:green"),

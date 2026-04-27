@@ -28,9 +28,7 @@ DEFAULT_CONFIG = {
     "horizon_lookback": {"long_term": 365, "medium_term": 90, "short_term": 10},
     # Cross-ticker covariance default correlation
     "cross_ticker_correlation": 0.3,
-    # Debate and discussion settings
-    "max_debate_rounds": 1,
-    "max_risk_discuss_rounds": 1,
+    # Graph execution settings
     "max_recur_limit": 100,
     "max_concurrent_tickers": 5,
     # Data vendor configuration

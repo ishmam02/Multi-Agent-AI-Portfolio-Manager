@@ -85,11 +85,13 @@ def format_config_summary(config: Dict[str, Any]) -> str:
     lines.append(f"  [cyan]Quick LLM:[/cyan]     {config.get('shallow_thinker', '?')}")
     lines.append(f"  [cyan]Deep LLM:[/cyan]      {config.get('deep_thinker', '?')}")
 
-    risk = config.get("risk_profile")
-    if risk:
-        goal = risk.goal if hasattr(risk, "goal") else risk.get("goal", "?")
-        risk_val = risk.risk if hasattr(risk, "risk") else risk.get("risk", "?")
-        lines.append(f"  [cyan]Risk Profile:[/cyan]  {goal} / {risk_val}")
+    cam = config.get("code_agent_model", "")
+    if cam:
+        lines.append(f"  [cyan]Code Agent:[/cyan]    {cam}")
+
+    horizons = config.get("horizons_enabled", [])
+    if horizons:
+        lines.append(f"  [cyan]Horizons:[/cyan]      {', '.join(h.replace('_', ' ') for h in horizons)}")
 
     alpaca = config.get("alpaca_api_key", "")
     if alpaca:

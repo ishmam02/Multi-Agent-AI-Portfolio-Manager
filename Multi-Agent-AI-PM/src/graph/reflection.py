@@ -55,7 +55,7 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
         from src.agents.utils.schemas import ResearchReport
 
         parts = []
-        for key in ["market_report", "sentiment_report", "news_report", "fundamentals_report"]:
+        for key in ["market_report", "fundamentals_report"]:
             raw = current_state.get(key, "")
             if not raw:
                 continue

@@ -252,6 +252,47 @@ def get_alpaca_global_news(
     )
 
 
+def get_latest_quote(api_key: str, secret_key: str, symbol: str) -> dict:
+    """Fetch latest quote for a symbol from Alpaca Market Data API.
+
+    Returns dict with:
+      - bid: float
+      - ask: float
+      - last: float (falls back to midpoint if unavailable)
+    """
+    resp = requests.get(
+        f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/quotes/latest",
+        headers=_get_headers(api_key, secret_key),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    quote = data.get("quote", {})
+    bid = float(quote.get("bp", 0))
+    ask = float(quote.get("ap", 0))
+
+    # Try to get last trade price if quote midpoint is zero
+    last = 0.0
+    if bid <= 0 or ask <= 0:
+        try:
+            trade_resp = requests.get(
+                f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest",
+                headers=_get_headers(api_key, secret_key),
+                timeout=10,
+            )
+            trade_resp.raise_for_status()
+            trade = trade_resp.json().get("trade", {})
+            last = float(trade.get("p", 0))
+        except Exception:
+            pass
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+    }
+
+
 def place_order(api_key: str, secret_key: str, order_params: dict) -> str:
     """Place an order on Alpaca Paper Trading from a flat order_params dict.
 

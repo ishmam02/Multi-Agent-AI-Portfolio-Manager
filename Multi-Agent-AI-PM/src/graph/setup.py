@@ -22,9 +22,9 @@ class GraphSetup:
         self,
         reasoning_llm: ChatOpenAI,
         code_agents: Dict[str, Any],
-        trader_memory,
         quick_thinking_llm: ChatOpenAI = None,
         research_depth: str = "medium",
+        horizons=("long_term", "medium_term", "short_term"),
     ):
         """Initialize with required components.
 
@@ -33,25 +33,24 @@ class GraphSetup:
         reasoning_llm      : LLM for Phase 1 (plan) and Phase 3 (thesis)
         code_agents        : Dict mapping analyst key -> CodeValidationAgent
                              e.g. {"market": CodeValidationAgent(..., analyst_type="market")}
-        trader_memory      : FinancialSituationMemory for the synthesis agent
         quick_thinking_llm : LLM for the synthesis node (falls back to reasoning_llm)
         research_depth     : "shallow" | "medium" | "deep"
+        horizons           : Tuple of horizon strings passed to the synthesis agent.
         """
         self.reasoning_llm = reasoning_llm
         self.code_agents = code_agents
-        self.trader_memory = trader_memory
         self.quick_thinking_llm = quick_thinking_llm or reasoning_llm
         self.research_depth = research_depth
+        self.horizons = horizons
 
     def setup_graph(
-        self, selected_analysts=["market", "news", "fundamentals"]
+        self, selected_analysts=["market", "fundamentals"]
     ):
         """Set up and compile the agent workflow graph.
 
         Args:
             selected_analysts (list): List of analyst types to include. Options are:
                 - "market": Market/technical analyst
-                - "news": News/macro analyst
                 - "fundamentals": Fundamentals analyst
         """
         if len(selected_analysts) == 0:
@@ -65,30 +64,16 @@ class GraphSetup:
                 self.reasoning_llm, self.code_agents["market"], self.research_depth,
             )
 
-        if "news" in selected_analysts:
-            analyst_nodes["news"] = create_news_analyst(
-                self.reasoning_llm, self.code_agents["news"], self.research_depth,
-            )
-
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
                 self.reasoning_llm, self.code_agents["fundamentals"], self.research_depth,
             )
 
-        # Synthesis Agent — uses the fundamentals code_agent as generic math executor
-        synthesis_code_agent = self.code_agents.get(
-            "fundamentals", list(self.code_agents.values())[0]
-        )
-        synthesis_node = create_synthesis_agent(
-            self.reasoning_llm,
-            synthesis_code_agent,
-            self.trader_memory,
-        )
+        synthesis_node = create_synthesis_agent(self.reasoning_llm, horizons=self.horizons)
 
         # Map each analyst type to its report field in AgentState
         report_keys_map = {
             "market": "market_report",
-            "news": "news_report",
             "fundamentals": "fundamentals_report",
         }
         required_reports = [
