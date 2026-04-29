@@ -27,6 +27,13 @@ from .alpha_vantage import (
     get_global_news as get_alpha_vantage_global_news,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from .sec_edgar import (
+    get_income_statement as get_sec_income_statement,
+    get_balance_sheet as get_sec_balance_sheet,
+    get_cashflow as get_sec_cashflow,
+    get_fundamentals as get_sec_fundamentals,
+    get_earnings_dates as get_sec_earnings_dates,
+)
 
 # Configuration and routing logic
 from .config import get_config
@@ -63,6 +70,7 @@ TOOLS_CATEGORIES = {
 VENDOR_LIST = [
     "yfinance",
     "alpha_vantage",
+    "sec_edgar",
 ]
 
 # Mapping of methods to their vendor-specific implementations
@@ -76,21 +84,26 @@ VENDOR_METHODS = {
     "get_fundamentals": {
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
+        "sec_edgar": get_sec_fundamentals,
     },
     "get_balance_sheet": {
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
+        "sec_edgar": get_sec_balance_sheet,
     },
     "get_cashflow": {
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
+        "sec_edgar": get_sec_cashflow,
     },
     "get_income_statement": {
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
+        "sec_edgar": get_sec_income_statement,
     },
     "get_earnings_dates": {
         "yfinance": get_yfinance_earnings_dates,
+        "sec_edgar": get_sec_earnings_dates,
     },
     "get_quarterly_history": {
         "yfinance": get_yfinance_quarterly_history,

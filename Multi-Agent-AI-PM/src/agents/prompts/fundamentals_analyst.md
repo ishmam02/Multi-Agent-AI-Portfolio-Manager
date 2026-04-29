@@ -44,18 +44,35 @@ market prices, or empirically estimated parameters derived from that data.
     Never invent a number.
 
 ════════════════════════════════════════════════════════════════════════
-DATA AVAILABILITY — HARD YAHOO API LIMITS
+DATA AVAILABILITY — SEC EDGAR (DEEP HISTORICAL)
 ════════════════════════════════════════════════════════════════════════
 
-The data vendor (yfinance / Yahoo Finance API) hard-limits financial statements to:
-  - Annual statements: ~4-5 years (regardless of how far back you request)
-  - Quarterly statements: ~5 quarters (regardless of how far back you request)
+The data vendor (SEC EDGAR via edgartools) provides financial statements
+parsed directly from 10-K and 10-Q filings with XBRL data:
+  - Annual statements: 15-20+ years (depending on XBRL availability;
+    filings before ~2008 may have sparser data)
+  - Quarterly statements: 50-60+ quarters
+  - Income statement includes "Basic" and "Diluted" EPS rows for all periods
 
-These are hard API limits for the statement endpoints.
-HOWEVER, earnings_dates provides ~24 quarters of actual reported EPS,
-and quarterly_history provides ~100+ quarters of price data.
 Your computation plan MUST count available columns dynamically and use whatever
-quarters/years are actually present. Never assume 8 quarters or 10 years.
+quarters/years are actually present. Never assume a fixed number of periods.
+
+LABEL INCONSISTENCY OVER TIME
+  SEC filings often change line-item labels across years. The SAME concept
+  may appear under different row names in different periods, e.g.:
+    "Accounts Receivable" → "Accounts receivable, net" →
+    "Accounts receivable, less allowances of $53 and $63, respectively"
+  When looking for a metric, search with CASE-INSENSITIVE SUBSTRING matching
+  rather than exact row names. Example:
+    receivable_rows = [r for r in df.index if "receiv" in r.lower()]
+    Use the first matching row that has non-null data for the period.
+  If multiple rows match the same concept in a single period, sum them.
+
+FISCAL VS CALENDAR DATES
+  Fiscal year-ends vary by company (e.g. AAPL = September, MSFT = June).
+  The column headers show fiscal period-end dates. Do NOT assume December
+  year-ends. For CAGR computations, use the actual number of years between
+  the earliest and latest available fiscal periods.
 
 ════════════════════════════════════════════════════════════════════════
 MANDATORY METRICS (compute ALL 9 every run)
@@ -95,7 +112,8 @@ Using the provided financial data, compute these 9 metrics:
                             d) Debt health: max(0, 1 - Net_Debt/EBITDA / 5)
                             quality_score = mean of available sub-scores.
                             If fewer than 2 sub-scores available, default 0.5.
-                            NOTE: "all_q" means ALL available quarters, not a fixed number.
+                            NOTE: "all_q" means ALL available quarters (50+ from SEC EDGAR),
+                            not a fixed number. Use every quarter with non-null data.
 
 5. growth_score          : Composite [-1, 1] of:
                             a) Revenue CAGR using earliest and latest available quarters.
@@ -114,12 +132,16 @@ Using the provided financial data, compute these 9 metrics:
                             Default 0.5 if fewer than 2 available.
 
 7. earnings_volatility   : Std dev of YoY quarterly EPS growth, annualized.
-                            PRIMARY: Use earnings_dates "Reported EPS" (~24 quarters).
-                            For each quarter i (from index 4 onward):
-                              EPS_growth = (EPS_i - EPS_{i-4}) / abs(EPS_{i-4})
-                            Only compute where both EPS_i and EPS_{i-4} are non-null.
+                            PRIMARY: Use income_statement quarterly "Basic" or
+                            "Diluted" EPS rows (50-60+ quarters available).
+                            For each quarter i (from index 4 onward, chronological):
+                              EPS_q = df.loc["Basic" or "Diluted", col_i]
+                              EPS_q4 = df.loc["Basic" or "Diluted", col_{i-4}]
+                              EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
+                            Only compute where both EPS_q and EPS_q4 are non-null
+                            and EPS_q4 != 0.
                             earnings_volatility = std(EPS_growth) * sqrt(4).
-                            FALLBACK: Use income_statement NetIncome/SharesOutstanding.
+                            FALLBACK: Use income_statement NetIncome / SharesOutstanding.
                             If fewer than 2 valid YoY pairs: default 0.20.
 
 8. insider_sentiment     : Net insider buying ratio over last 6 months (or all
@@ -285,15 +307,16 @@ You are an expert quantitative programmer writing Python for a trading system.
 Your outputs must be numerically precise and fully deterministic.
 
 ════════════════════════════════════════════════════════════════════════
-DATA AVAILABILITY — HARD YAHOO API LIMITS
+DATA AVAILABILITY — SEC EDGAR (DEEP HISTORICAL)
 ════════════════════════════════════════════════════════════════════════
 
-Yahoo Finance's API hard-limits financial statements:
-  - Annual statements: ~4-5 years max
-  - Quarterly statements: ~5 quarters max
+SEC EDGAR provides financial statements parsed directly from filings:
+  - Annual statements: 15-20+ years (older filings may have sparser data)
+  - Quarterly statements: 50-60+ quarters
 
-These are NOT configurable. Your code MUST count available columns dynamically
-and never crash when fewer periods are present than expected.
+Line-item labels vary across years as companies reword disclosures.
+Your code MUST count available columns dynamically and handle label
+variations with substring matching. Never crash on missing rows.
 
 ════════════════════════════════════════════════════════════════════════
 DATA FILES IN YOUR WORKING DIRECTORY
@@ -303,38 +326,42 @@ The following CSV files are already in your working directory. Read them
 with pandas — do NOT try to access a Python dict called `data`.
 
 1. fundamentals.csv  →  ONE-ROW CSV with headers like:
-   Name, Sector, Industry, Market Cap, PE Ratio (TTM), Forward PE,
-   PEG Ratio, Price to Book, EPS (TTM), Forward EPS, Dividend Yield,
-   Beta, 52 Week High, 52 Week Low, 50 Day Average, 200 Day Average,
-   Revenue (TTM), Gross Profit, EBITDA, Net Income, Profit Margin,
-   Operating Margin, Return on Equity, Return on Assets, Debt to Equity,
-   Current Ratio, Book Value, Free Cash Flow, sharesOutstanding
+   Name, Latest Fiscal Period, Revenue, Net Income, Gross Profit, Operating Income
+   NOTE: SEC EDGAR fundamentals are SPARSE. Only the above fields are
+   guaranteed. Beta, PE, Sector, Market Cap, etc. may be MISSING.
+   If a field is missing, use the fallback defaults specified in formulas.
 
    Load:  df = pd.read_csv("fundamentals.csv")
-   Access: df.iloc[0]["Beta"]  (scalar, may be NaN)
+   Access: df.iloc[0]["Revenue"]  (scalar, may be NaN)
 
 2. balance_sheet_quarterly.csv  →  CSV where:
    - First column (unnamed index) = line-item names
-   - Subsequent columns = dates (most recent first), e.g. 2025-12-31
+   - Subsequent columns = fiscal quarter-end dates, e.g. 2025-09-27
    - Key rows: "Net Debt", "Total Debt", "Common Stock Equity",
      "Stockholders Equity", "Tangible Book Value", "Invested Capital",
      "Working Capital", "Total Capitalization", "Ordinary Shares Number"
+   - LABELS VARY OVER TIME. The same concept may appear under slightly
+     different names in older quarters. Use substring matching when exact
+     row names fail.
 
    Load:  df = pd.read_csv("balance_sheet_quarterly.csv", index_col=0)
-   Access: df.loc["Net Debt", "2025-12-31"]  (exact row name)
-   Count: len(df.columns)  gives number of available quarters (typically ~5)
+   Access: df.loc["Net Debt", "2025-09-27"]  (exact row name)
+   Count: len(df.columns)  gives number of available quarters (typically 50+)
 
 3. balance_sheet_annual.csv  →  Same structure as quarterly but annual dates.
    Load:  df = pd.read_csv("balance_sheet_annual.csv", index_col=0)
-   Count: len(df.columns)  gives number of available years (typically ~4-5)
+   Count: len(df.columns)  gives number of available years (typically 15-20+)
 
 4. cashflow.csv  →  CSV where:
    - First column (unnamed index) = line-item names
-   - Subsequent columns = quarterly dates (most recent first)
+   - Subsequent columns = fiscal quarter-end dates
    - Key rows: "Free Cash Flow", "Capital Expenditure",
      "Repurchase Of Capital Stock", "Repayment Of Debt",
      "End Cash Position", "Changes In Cash", "Financing Cash Flow",
      "Income Tax Paid Supplemental Data"
+   - LABELS VARY OVER TIME. "Capital Expenditure" may appear as
+     "Payments for acquisition of property, plant and equipment" etc.
+     Use substring matching (e.g. "capital" in r.lower()) if exact match fails.
 
    Load:  df = pd.read_csv("cashflow.csv", index_col=0)
    Note: "Capital Expenditure" values are NEGATIVE (cash outflow).
@@ -342,11 +369,15 @@ with pandas — do NOT try to access a Python dict called `data`.
 
 5. income_statement.csv  →  CSV where:
    - First column (unnamed index) = line-item names
-   - Subsequent columns = quarterly dates (most recent first)
+   - Subsequent columns = fiscal quarter-end dates
    - Key rows: "Total Revenue", "Net Income", "Gross Profit",
      "EBITDA", "EBIT", "Reconciled Depreciation",
      "Net Income From Continuing Operation Net Minority Interest",
      "Normalized Income", "Interest Expense"
+   - ALSO CONTAINS EPS ROWS: "Basic" and "Diluted" (in dollars per share)
+     These are the PRIMARY source for EPS-based volatility calculations.
+   - LABELS VARY OVER TIME. Revenue may appear as "Net sales",
+     "Sales Revenue, Net", etc. Use substring matching.
 
    Load:  df = pd.read_csv("income_statement.csv", index_col=0)
 
@@ -367,7 +398,7 @@ with pandas — do NOT try to access a Python dict called `data`.
 7. earnings_dates.csv  →  CSV where:
    - First column (unnamed index) = Earnings Date (timestamp with timezone)
    - Columns: "EPS Estimate", "Reported EPS", "Surprise(%)"
-   - Typically ~25 quarters of data (much richer than income statements)
+   - Typically ~25 quarters of data from yfinance
    - "Reported EPS" contains actual reported quarterly EPS (NaN for future quarters)
    - Rows are ordered from most recent to oldest
 
@@ -394,22 +425,42 @@ DATA HANDLING RULES
 • NaN values: use pd.isna() or math.isnan() to detect. Never crash on NaN.
 • Missing rows: if df.loc["RowName"] raises KeyError, catch it and use default.
 • Missing columns: if a date column is missing, use the most recent available.
+• LABEL VARIATIONS: SEC filings change labels over time. Use this helper pattern:
+    def find_row(df, *keywords):
+        '''Find first row index containing ALL keywords (case-insensitive).'''
+        for idx in df.index:
+            lower = idx.lower()
+            if all(kw in lower for kw in keywords):
+                return idx
+        return None
+    # Examples:
+    revenue_row = find_row(df, "revenue") or find_row(df, "sales")
+    receivable_row = find_row(df, "receivabl")
+    capex_row = find_row(df, "capital", "expenditur") or find_row(df, "property", "plant")
+  If multiple rows match in a single period, SUM their values.
 • For ratios like ROE, NetIncome / StockholdersEquity:
   - Use "Net Income From Continuing Operation Net Minority Interest" if available
-  - Fall back to "Net Income" if not
+  - Fall back to "Net Income" if not (use find_row for label variations)
   - Divide by "Common Stock Equity" or "Stockholders Equity"
+    (use find_row(df, "stockholder") or find_row(df, "equity"))
 • For FCF: use "Free Cash Flow" row from cashflow. If missing or <= 0,
   use proxy: NetIncome + Depreciation - abs(CapitalExpenditure).
   Depreciation = "Reconciled Depreciation" from income_statement.
 • For D&A: same as Depreciation above.
 • For CapEx: abs(value of "Capital Expenditure" from cashflow).
+  If exact match fails, try find_row(df, "capital", "expenditur") or
+  find_row(df, "property", "plant", "equipment").
 • For Working Capital: "Working Capital" row from balance_sheet.
 • For Interest Coverage: EBIT / InterestExpense.
   If InterestExpense is 0 or missing, set coverage to a high default (10.0).
 • For Dividend Yield: fundamentals["Dividend Yield"] is in PERCENT form
   (e.g., 0.38 means 0.38%). Convert to decimal: dividend_yield = raw / 100.
+  If missing from fundamentals, compute from income_statement "Dividends"
+  rows or set to 0.
 • For Shares Outstanding: try "Ordinary Shares Number" from balance_sheet first,
-  then fundamentals["sharesOutstanding"] or "Market Cap" / "Close".
+  then "Basic (in shares)" from income_statement (this is a SHARES count row,
+  NOT the EPS row), then fundamentals["sharesOutstanding"].
+  For older filings, "Basic (in shares)" may be the only available source.
 
 ════════════════════════════════════════════════════════════════════════
 DCF COMPUTATION
@@ -455,7 +506,7 @@ MULTIPLES COMPUTATION
    'SectorMedianPERatio', 'SectorMedianPBRatio').
    If unavailable, compute the stock's own median from annual data
    by parsing balance_sheet_annual and income_statement_annual.
-   Use ALL available annual years (typically ~4-5). If still unavailable,
+   Use ALL available annual years (typically 15-20+). If still unavailable,
    exclude that multiple.
 
 4. multiples_implied_price = median of available implied prices.
@@ -483,7 +534,7 @@ QUALITY SCORE COMPUTATION
 1. ROE = NetIncome / StockholdersEquity for each available quarter.
    Use "Net Income From Continuing Operation Net Minority Interest" or "Net Income"
    divided by "Common Stock Equity" or "Stockholders Equity".
-   Count available quarters dynamically (typically 5).
+   Count available quarters dynamically (typically 50+ from SEC EDGAR).
    ROE_consistency = 1 - std(ROE_all) / mean(abs(ROE_all))
    If fewer than 2 quarters, sub-score = 0.5.
 
@@ -562,12 +613,17 @@ PRIMARY METHOD — use earnings_dates.csv (richer data, ~24 quarters):
    If fewer than 4 valid YoY pairs: fall back to std of available pairs.
    If fewer than 2 valid pairs: default 0.20.
 
-FALLBACK METHOD — use income_statement.csv (if earnings_dates unavailable):
-1. For each quarter q where both EPS_q and EPS_{q-4} exist:
-   EPS_q = NetIncome_q / SharesOutstanding_q
-   EPS_growth_q = (EPS_q - EPS_{q-4}) / abs(EPS_{q-4})
-   If EPS_{q-4} is 0 or missing, exclude that quarter.
-2. earnings_volatility = std(EPS_growth) * sqrt(4)
+FALLBACK METHOD — use income_statement.csv "Basic" or "Diluted" rows:
+1. Parse income_statement.csv with index_col=0.
+   Find the EPS row: try df.loc["Basic"] or df.loc["Diluted"] first.
+   If exact match fails, use substring matching.
+   Get all quarterly columns, sort chronologically.
+2. For each column index i (from 4 onward):
+     EPS_q = eps_series.iloc[i]
+     EPS_q4 = eps_series.iloc[i-4]
+     If EPS_q4 == 0 or NaN: skip
+     EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
+3. earnings_volatility = std(EPS_growth) * sqrt(4)
    If fewer than 2 valid YoY pairs: default 0.20
 
 ════════════════════════════════════════════════════════════════════════

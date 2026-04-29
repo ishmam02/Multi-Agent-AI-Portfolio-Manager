@@ -146,9 +146,9 @@ def _log(
 # ── Constants ────────────────────────────────────────────────────────────────
 
 HORIZON_LOOKBACK = {
-    "long_term": 365*4,
-    "medium_term": 90*4,
-    "short_term": 30*4,
+    "long_term": 365 * 4,
+    "medium_term": 90 * 4,
+    "short_term": 30 * 4,
 }
 
 MAX_PASSES = {
@@ -1765,10 +1765,8 @@ def create_analyst_node(
 
         horizon_results: Dict[str, HorizonOutput] = {}
         all_metrics_selected: List[MetricPlanEntry] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = {
-                pool.submit(_run_horizon, h): h for h in active_horizons
-            }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_run_horizon, h): h for h in active_horizons}
             for fut in concurrent.futures.as_completed(futures):
                 horizon, result = fut.result()
                 horizon_results[horizon] = result["final_output"]

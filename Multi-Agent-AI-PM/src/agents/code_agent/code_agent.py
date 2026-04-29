@@ -122,6 +122,7 @@ _COMMON_LIBS = ["math", "json", "datetime", "typing", "statistics"]
 ANALYST_LIBRARIES: dict[str, list[str]] = {
     "fundamental": ["numpy", "pandas", "scipy"] + _COMMON_LIBS,
     "market": ["numpy", "pandas", "talib", "scipy", "scikit-learn"] + _COMMON_LIBS,
+    "news": ["numpy", "pandas", "re", "collections", "itertools"] + _COMMON_LIBS,
 }
 
 # ── Load prompts from external markdown file ────────────────────────────────
@@ -274,6 +275,30 @@ class CodeValidationAgent:
         return "text"
 
     @staticmethod
+    def _is_financial_statement_csv(text: str) -> bool:
+        """Detect financial-statement CSVs produced by yfinance.
+
+        These CSVs have:
+          • first header = 'Metric' (or empty before fix) followed by date columns
+          • first data rows = metric names like 'Total Revenue', 'Net Income', etc.
+          • columns are reporting periods (dates), not time-series observations
+        """
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return False
+        header = lines[0]
+        # Header starts with 'Metric' (after fix) or empty first field, then dates
+        parts = header.split(",")
+        if len(parts) < 2:
+            return False
+        first_field = parts[0].strip()
+        if first_field not in ("", "Metric"):
+            return False
+        # At least one column looks like a date (YYYY-MM-DD)
+        date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        return any(date_pattern.match(p.strip()) for p in parts[1:])
+
+    @staticmethod
     def _scaffold_metrics_file(work_dir: str, data: dict) -> tuple[str, list[str]]:
         """Write all data files to *work_dir* and return (script_path, created_files).
 
@@ -310,10 +335,21 @@ class CodeValidationAgent:
                     varname = "df" if primary_df_var is None else f"{key}_df"
                     if primary_df_var is None:
                         primary_df_var = varname
-                    snippet = (
-                        f'{varname} = pd.read_csv("{fname}", index_col=0, parse_dates=True)\n'
-                        f"try:\n    {varname}.sort_index(inplace=True)\nexcept Exception:\n    pass\n"
-                    )
+
+                    # Financial-statement CSVs have metric names as index and date
+                    # strings as columns — do NOT parse_dates on the index.
+                    is_fs = CodeValidationAgent._is_financial_statement_csv(cleaned)
+                    if is_fs:
+                        snippet = (
+                            f'{varname} = pd.read_csv("{fname}", index_col=0)\n'
+                            f"# index = metric names (e.g. 'Total Revenue', 'Net Income')\n"
+                            f"# columns = reporting-period dates (strings like '2025-12-31')\n"
+                        )
+                    else:
+                        snippet = (
+                            f'{varname} = pd.read_csv("{fname}", index_col=0, parse_dates=True)\n'
+                            f"try:\n    {varname}.sort_index(inplace=True)\nexcept Exception:\n    pass\n"
+                        )
 
                 elif kind == "kv":
                     rows = []
@@ -755,20 +791,44 @@ class CodeValidationAgent:
         # ── Gather context the agent would normally spend turns discovering ──
         dir_listing = "\n".join(f"  {f}" for f in sorted(os.listdir(work_dir)))
 
-        primary_csv = next(
-            (f for f in data_files if f.endswith(".csv") and f != "metrics.py"), None
-        )
+        # Build comprehensive data preview for ALL CSV files so the agent
+        # never needs to waste turns reading files it already has.
         data_preview = ""
-        if primary_csv:
+        for fname in sorted(data_files):
+            if not fname.endswith(".csv") or fname == "metrics.py":
+                continue
+            fpath = os.path.join(work_dir, fname)
             try:
-                with open(os.path.join(work_dir, primary_csv), encoding="utf-8") as fh:
-                    lines = [fh.readline() for _ in range(12)]
-                data_preview = (
-                    f"\n=== HEAD OF {primary_csv} (first 12 rows) ===\n"
-                    + "".join(lines).rstrip()
-                )
+                with open(fpath, encoding="utf-8") as fh:
+                    text = fh.read()
             except Exception:
-                pass
+                continue
+
+            # Financial statements: show all rows (typically < 80) so the agent
+            # has exact metric names and values without reading files.
+            if CodeValidationAgent._is_financial_statement_csv(text):
+                lines = text.splitlines()
+                data_preview += (
+                    f"\n=== FULL CONTENTS OF {fname} ===\n"
+                    + "\n".join(lines[:80])  # cap at 80 rows
+                )
+                if len(lines) > 80:
+                    data_preview += f"\n... ({len(lines) - 80} more rows) ...\n"
+                data_preview += "\n"
+                continue
+
+            # Non-financial CSVs: show first 12 rows
+            lines = text.splitlines()
+            if len(lines) <= 12:
+                data_preview += (
+                    f"\n=== FULL CONTENTS OF {fname} ===\n" + text.rstrip() + "\n\n"
+                )
+            else:
+                data_preview += (
+                    f"\n=== HEAD OF {fname} (first 12 rows) ===\n"
+                    + "\n".join(lines[:12])
+                    + f"\n... ({len(lines) - 12} more rows) ...\n\n"
+                )
 
         with open(script_path, encoding="utf-8") as fh:
             scaffold_src = fh.read()
@@ -779,7 +839,10 @@ class CodeValidationAgent:
             + data_preview
             + f"\n\n=== CURRENT {script_path} (scaffold) ===\n{scaffold_src}"
             + f"\n\nIMPORTANT: All files above already exist in {work_dir}. "
-            "Do NOT run ls, cat, or head — you already have everything you need above. "
+            "Do NOT run ls, cat, head, or tail — data file contents are shown above. "
+            "Do NOT Read any data CSVs, JSONs, or TXTs — their full contents are in this prompt. "
+            "You may only Read metrics.py when debugging. "
+            "Start coding immediately. "
             f"Immediately overwrite {script_path} with the full implementation using a "
             f"heredoc (`cat > {script_path} << 'PYEOF' ... PYEOF`) and run it with "
             f"`python3 {script_path}`.\n"

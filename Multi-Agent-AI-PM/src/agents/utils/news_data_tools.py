@@ -12,12 +12,17 @@ def get_news(
     """
     Retrieve news data for a given ticker symbol.
     Uses the configured news_data vendor.
+
+    CRITICAL: Keep date range NARROW (3-30 days).  Broad ranges overflow the
+    context window and crash the pipeline.  For long lookbacks, make multiple
+    targeted calls instead of one giant request.
+
     Args:
         ticker (str): Ticker symbol
-        start_date (str): Start date in yyyy-mm-dd format
-        end_date (str): End date in yyyy-mm-dd format
+        start_date (str): Start date in yyyy-mm-dd format (keep range narrow!)
+        end_date (str): End date in yyyy-mm-dd format (keep range narrow!)
     Returns:
-        str: A formatted string containing news data
+        str: A formatted string containing news data (capped at 50 articles)
     """
     return route_to_vendor("get_news", ticker, start_date, end_date)
 

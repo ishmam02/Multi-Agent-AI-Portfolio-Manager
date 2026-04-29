@@ -74,11 +74,13 @@ def _fetch_alpaca_news(
     start: str | None = None,
     end: str | None = None,
     limit: int = 50,
+    max_pages: int = 2,
 ) -> list[dict]:
     """Fetch news from Alpaca News API with pagination support.
 
     Alpaca returns max 50 articles per request. Uses next_page_token to
-    paginate until all articles in the date range are retrieved.
+    paginate.  max_pages caps total articles (default 2 pages = 100 articles)
+    to avoid context-bloat and truncation warnings.
 
     Args:
         api_key: Alpaca API key
@@ -88,10 +90,13 @@ def _fetch_alpaca_news(
         start: Start datetime in ISO 8601 format (e.g. "2023-01-01T00:00:00Z")
         end: End datetime in ISO 8601 format
         limit: Max articles per page (Alpaca caps at 50)
+        max_pages: Max pages to fetch (default 2 = 100 articles).  Never
+                   exceeds 5; values > 5 are clamped to 5.
 
     Returns:
         List of news article dicts from Alpaca.
     """
+    max_pages = min(max_pages, 5)
     params: dict[str, str | int | bool] = {
         "limit": min(limit, 50),
         "include_content": False,
@@ -106,7 +111,6 @@ def _fetch_alpaca_news(
 
     articles: list[dict] = []
     next_token: str | None = None
-    max_pages = 50  # 50 × 50 = 2,500 articles max across full date range
     total_pages = 0
 
     for _ in range(max_pages):
@@ -132,12 +136,6 @@ def _fetch_alpaca_news(
         if not next_token or not batch:
             break
 
-    if next_token and total_pages >= max_pages:
-        print(
-            f"[Alpaca News] WARNING: Truncated at {len(articles)} articles "
-            f"({max_pages} pages). More news exists in date range but safety cap reached."
-        )
-
     return articles
 
 
@@ -149,23 +147,41 @@ def _format_alpaca_news(
 ) -> str:
     """Format Alpaca news articles as a CSV string.
 
-    Columns: date, headline, summary
+    Columns: date, headline, summary, url.  Capped at MAX_ARTICLES to fit context window.
     """
     import csv
     import io
+
+    MAX_ARTICLES = 50
 
     if not articles:
         if ticker:
             return f"No news found for {ticker}"
         return "No global news found"
 
+    # Deduplicate by URL — same article can appear in overlapping date windows
+    seen_urls: set[str] = set()
+    deduped: list[dict] = []
+    for art in articles:
+        url = art.get("url", "")
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        deduped.append(art)
+    articles = deduped
+
+    if len(articles) > MAX_ARTICLES:
+        articles = articles[:MAX_ARTICLES]
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["date", "headline", "summary"])
+    writer.writerow(["date", "headline", "summary", "url"])
 
     for art in articles:
         headline = art.get("headline", "No title")
         summary = art.get("summary", "")
+        url = art.get("url", "")
 
         # Parse created_at to YYYY-MM-DD
         created = art.get("created_at", "")
@@ -179,9 +195,29 @@ def _format_alpaca_news(
 
         # Escape newlines in summary so CSV stays single-line per row
         summary_clean = summary.replace("\n", " ").replace("\r", " ") if summary else ""
-        writer.writerow([article_date, headline, summary_clean])
+        writer.writerow([article_date, headline, summary_clean, url])
 
     return buf.getvalue()
+
+
+def _split_date_range(start_date: str, end_date: str, max_window_days: int = 14) -> list[tuple[str, str]]:
+    """Split a yyyy-mm-dd range into non-overlapping windows of at most max_window_days."""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    if start_dt > end_dt:
+        return []
+    total_days = (end_dt - start_dt).days
+    if total_days <= max_window_days:
+        return [(start_date, end_date)]
+    windows: list[tuple[str, str]] = []
+    cur = start_dt
+    while cur <= end_dt:
+        win_end = min(cur + timedelta(days=max_window_days), end_dt)
+        windows.append((cur.strftime("%Y-%m-%d"), win_end.strftime("%Y-%m-%d")))
+        cur = win_end + timedelta(days=1)
+        if cur > end_dt:
+            break
+    return windows
 
 
 def get_alpaca_news(
@@ -193,25 +229,53 @@ def get_alpaca_news(
 ) -> str:
     """Retrieve company-specific news via Alpaca News API.
 
-    Falls back to empty string if credentials are missing.
+    Wide date ranges are automatically split into 14-day windows so truncation
+    does not bias toward only the most recent news.  Results are merged and
+    deduplicated.
     """
     api_key = api_key or _get_alpaca_credentials()[0]
     secret_key = secret_key or _get_alpaca_credentials()[1]
     if not api_key or not secret_key:
         return f"Alpaca credentials not configured. Cannot fetch news for {ticker}."
 
-    # Alpaca expects ISO 8601; convert yyyy-mm-dd to midnight UTC
-    start_iso = f"{start_date}T00:00:00Z"
-    end_iso = f"{end_date}T23:59:59Z"
+    # Alpaca returns newest first; split wide ranges into narrow windows.
+    # Fetch only 1 page (50 articles) per older window and 2 pages (100) for
+    # the most recent window — this gives spread across the range with more
+    # weight on newer news, and never hits the 250-article cap.
+    windows = _split_date_range(start_date, end_date, max_window_days=14)
+    if len(windows) == 1:
+        # Narrow range — single fetch, 2 pages for more recent coverage
+        start_iso = f"{start_date}T00:00:00Z"
+        end_iso = f"{end_date}T23:59:59Z"
+        articles = _fetch_alpaca_news(
+            api_key, secret_key, symbols=ticker, start=start_iso, end=end_iso,
+            limit=50, max_pages=2,
+        )
+    else:
+        # Wide range — fetch each window separately, merge, dedupe.
+        # Last window is most recent → 2 pages; all others → 1 page.
+        all_articles: list[dict] = []
+        for i, (w_start, w_end) in enumerate(windows):
+            start_iso = f"{w_start}T00:00:00Z"
+            end_iso = f"{w_end}T23:59:59Z"
+            pages = 2 if i == len(windows) - 1 else 1
+            batch = _fetch_alpaca_news(
+                api_key, secret_key, symbols=ticker, start=start_iso, end=end_iso,
+                limit=50, max_pages=pages,
+            )
+            all_articles.extend(batch)
+        # Deduplicate by URL across windows
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for art in all_articles:
+            url = art.get("url", "")
+            if url and url in seen:
+                continue
+            if url:
+                seen.add(url)
+            deduped.append(art)
+        articles = deduped
 
-    articles = _fetch_alpaca_news(
-        api_key,
-        secret_key,
-        symbols=ticker,
-        start=start_iso,
-        end=end_iso,
-        limit=50,
-    )
     return _format_alpaca_news(articles, ticker=ticker, start_date=start_date, end_date=end_date)
 
 
@@ -243,6 +307,7 @@ def get_alpaca_global_news(
         start=start_iso,
         end=end_iso,
         limit=50,
+        max_pages=2,
     )
     return _format_alpaca_news(
         articles,

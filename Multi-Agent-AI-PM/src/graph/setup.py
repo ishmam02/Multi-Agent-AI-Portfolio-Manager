@@ -62,19 +62,31 @@ class GraphSetup:
         if "market" in selected_analysts:
             analyst_nodes["market"] = create_market_analyst(
                 self.reasoning_llm, self.code_agents["market"], self.research_depth,
+                active_horizons=self.horizons,
             )
 
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
                 self.reasoning_llm, self.code_agents["fundamentals"], self.research_depth,
+                active_horizons=self.horizons,
             )
 
-        synthesis_node = create_synthesis_agent(self.reasoning_llm, horizons=self.horizons)
+        if "news" in selected_analysts:
+            analyst_nodes["news"] = create_news_analyst(
+                self.reasoning_llm, self.research_depth, self.horizons
+            )
+
+        synthesis_node = create_synthesis_agent(
+            self.reasoning_llm,
+            horizons=self.horizons,
+            research_depth=self.research_depth,
+        )
 
         # Map each analyst type to its report field in AgentState
         report_keys_map = {
             "market": "market_report",
             "fundamentals": "fundamentals_report",
+            "news": "news_report",
         }
         required_reports = [
             report_keys_map[a] for a in selected_analysts if a in report_keys_map

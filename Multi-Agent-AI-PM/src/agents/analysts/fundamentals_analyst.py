@@ -63,7 +63,7 @@ def gather_fundamental_data(ticker: str, trade_date: str, lookback_days: int) ->
 # ── Node factory ─────────────────────────────────────────────────────────────
 
 
-def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="medium"):
+def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="medium", active_horizons=("long_term",)):
     """Create a fundamentals analyst node for the outer AgentState graph.
 
     Parameters
@@ -71,6 +71,7 @@ def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="mediu
     reasoning_llm  : LangChain chat model for Phase 1 (plan) and Phase 3 (thesis)
     code_agent     : CodeValidationAgent instance for Phase 2 (compute)
     research_depth : "shallow" | "medium" | "deep"
+    active_horizons : Tuple of horizons to evaluate (e.g. ("short_term",) or ("long_term", "medium_term", "short_term"))
     """
     analyst_config = {
         "agent_type": AgentType.FUNDAMENTAL,
@@ -80,7 +81,7 @@ def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="mediu
         "phase2_system_prompt": PHASE2_PROMPT,
         "phase3_system_prompt": PHASE3_PROMPT,
         "horizon_focus": HORIZON_FOCUS,
-        "active_horizons": ("long_term",),
+        "active_horizons": active_horizons,
     }
 
     return create_analyst_node(
@@ -191,84 +192,30 @@ def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="mediu
 if __name__ == "__main__":
     import pathlib
 
-    # ── Simple single-run test ────────────────────────────────────────────────
     _project_root = str(pathlib.Path(__file__).resolve().parents[3])
-
-    TICKER = "AAPL"
-    TRADE_DATE = "2026-04-24"
-    RESEARCH_DEPTH = "shallow"
-    RANDOM_SEED = 42
 
     from src.llm_clients import create_llm_client
     from src.agents.code_agent.code_agent import CodeValidationAgent
     from src.agents.utils.schemas import ResearchReport
 
-    llm_client = create_llm_client(
+    llm = create_llm_client(
         provider="ollama",
         model="minimax-m2.7:cloud",
         base_url="http://localhost:11434/v1",
         max_retries=10,
         reasoning_effort="high",
         temperature=0,
-        seed=RANDOM_SEED,
-    )
-    reasoning_llm = llm_client.get_llm()
-
-    code_agent = CodeValidationAgent(
+        seed=42,
+    ).get_llm()
+    ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
         timeout=60,
         max_iterations=5,
         analyst_type="fundamental",
         project_root=_project_root,
-        verbose=True,
+        verbose=False,
     )
-
-    fundamentals_node = create_fundamentals_analyst(
-        reasoning_llm, code_agent, RESEARCH_DEPTH
-    )
-
-    init_state = {
-        "company_of_interest": TICKER,
-        "trade_date": TRADE_DATE,
-    }
-
-    print(f"Running fundamentals analysis for {TICKER} on {TRADE_DATE} ...")
-    result = fundamentals_node(init_state)
-
-    report_json = result.get("fundamentals_report", "{}")
-    try:
-        report = ResearchReport.model_validate_json(report_json)
-    except Exception as exc:
-        print(f"Failed to parse ResearchReport: {exc}")
-        print("Raw JSON:")
-        print(report_json)
-        raise SystemExit(1)
-
-    print(f"\n{'=' * 60}")
-    print("Full Report.")
-    print(json.dumps(report, indent=2))
-    print(f"{'=' * 60}")
-
-    print(f"\n{'=' * 60}")
-    print(f"  FUNDAMENTALS REPORT — {TICKER} @ {TRADE_DATE}")
-    print(f"{'=' * 60}\n")
-
-    print(f"mu:")
-    print(f"  long_term   = {report.mu.long_term:+.6f}")
-
-    print(f"\nsigma_contribution:")
-    print(f"  long_term   = {report.sigma_contribution.long_term:.6f}")
-
-    print(f"\nconviction:")
-    print(f"  long_term   = {report.conviction.long_term:.4f}")
-
-    print(f"\nthesis")
-    print(report.investment_thesis)
-
-    print(f"\ncomputed_metrics ({len(report.computed_metrics)}):")
-    for m in report.computed_metrics:
-        print(f"  {m.metric_name}: {m.value}")
-
-    print(f"\n{'=' * 60}")
-    print("Done.")
-    print(f"{'=' * 60}")
+    node = create_fundamentals_analyst(llm, ca, "shallow", active_horizons=("long_term",))
+    result = node({"company_of_interest": "AAPL", "trade_date": "2025-03-14"})
+    report = ResearchReport.model_validate_json(result.get("fundamentals_report", "{}"))
+    print(report.model_dump_json(indent=2))

@@ -10,6 +10,7 @@ console = Console()
 ANALYST_ORDER = [
     ("Market Analyst", AnalystType.MARKET),
     ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
+    ("News Analyst", AnalystType.NEWS),
 ]
 
 

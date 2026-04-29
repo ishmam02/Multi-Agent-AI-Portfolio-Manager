@@ -78,8 +78,9 @@ Bash
   • Keep iterating (fix → save → run) until `python3 metrics.py` exits 0
     and prints valid JSON with NO errors.  Do not stop at the first draft.
   • NEVER run `pip install` — all allowed libraries are already installed.
-  • NEVER run `ls`, `cat`, `head`, or `tail` — all data files and their
-    contents are provided in the prompt.  Start coding immediately.
+  • NEVER run `ls`, `cat`, `head`, or `tail` — data file contents are in the prompt.
+    Do NOT Read any data CSVs, JSONs, or TXTs — their full contents are provided.
+    You may only Read metrics.py when debugging.  Start coding immediately.
 
 WebSearch  (fallback only — do NOT use before writing code)
   • Use ONLY after a failed execution when the error is unclear.
@@ -106,6 +107,46 @@ File paths
 
 Allowed Python imports: {allowed_libs}
 Do NOT import anything outside this list (uuid, inspect, json are always allowed).
+
+════════════════════════════════════════════════════════
+DATA FORMAT REFERENCE
+════════════════════════════════════════════════════════
+
+Financial-statement CSVs (balance_sheet_quarterly, balance_sheet_annual,
+cashflow, income_statement) have this exact structure:
+
+  • FIRST COLUMN (index):  metric name, e.g. "Total Revenue", "Net Income"
+  • REMAINING COLUMNS:     reporting-period dates as STRINGS, e.g. "2025-12-31"
+
+Load them with:
+  df = pd.read_csv("file.csv", index_col=0)
+  # DO NOT use parse_dates=True — the index contains metric names, not dates.
+
+Access values with:
+  df.loc["Net Income", "2025-12-31"]   # scalar lookup
+  df.loc["Total Revenue"]             # Series across all periods
+  df.columns                            # list of period strings
+
+Common metric names you may see:
+  Income statement: Total Revenue, Cost Of Revenue, Gross Profit,
+    Operating Income, Net Income, EBITDA, EBIT, Basic EPS, Diluted EPS,
+    Research And Development, Selling General And Administration,
+    Total Expenses, Tax Provision, Reconciled Depreciation
+  Balance sheet: Total Assets, Total Liabilities Net Minority Interest,
+    Stockholders Equity, Common Stock Equity, Total Debt, Net Debt,
+    Cash And Cash Equivalents, Current Assets, Current Liabilities,
+    Working Capital, Inventory, Accounts Receivable, Accounts Payable,
+    Retained Earnings, Net PPE, Total Equity Gross Minority Interest
+  Cash flow: Free Cash Flow, Operating Cash Flow, Financing Cash Flow,
+    Investing Cash Flow, Capital Expenditure, Repurchase Of Capital Stock,
+    Cash Dividends Paid, Net Income From Continuing Operations,
+    Depreciation And Amortization, Changes In Working Capital,
+    End Cash Position, Beginning Cash Position
+
+The fundamentals.csv is a KEY-VALUE file with one header row and one data row.
+Load it with:
+  df = pd.read_csv("fundamentals.csv")
+  # Access: df.loc[0, "Market Cap"] or df.iloc[0]["Market Cap"]
 
 ════════════════════════════════════════════════════════
 OUTPUT REQUIREMENT

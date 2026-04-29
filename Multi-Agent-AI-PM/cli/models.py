@@ -6,6 +6,7 @@ from pydantic import BaseModel
 class AnalystType(str, Enum):
     MARKET = "market"
     FUNDAMENTALS = "fundamentals"
+    NEWS = "news"
 
 
 class RiskProfile(BaseModel):

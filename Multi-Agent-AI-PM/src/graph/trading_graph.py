@@ -93,9 +93,12 @@ class TradingAgentsGraph:
         _analyst_type_map = {
             "market": "market",
             "fundamentals": "fundamental",
+            "news": "news",
         }
         self.code_agents = {}
         for analyst_key in selected_analysts:
+            if analyst_key == "news":
+                continue  # News analyst uses LLM-only tool calling, no code agent
             ca_type = _analyst_type_map.get(analyst_key, "fundamental")
             self.code_agents[analyst_key] = CodeValidationAgent(
                 model=self.config.get("code_agent_model", "kimi-k2.5:cloud"),
@@ -435,6 +438,8 @@ class TradingAgentsGraph:
             "trade_date": final_state["trade_date"],
             "market_report": final_state.get("market_report", ""),
             "fundamentals_report": final_state.get("fundamentals_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "confidence_rationale": final_state.get("confidence_rationale", {}),
             "composite_signal": final_state.get("composite_signal", ""),
         }
 

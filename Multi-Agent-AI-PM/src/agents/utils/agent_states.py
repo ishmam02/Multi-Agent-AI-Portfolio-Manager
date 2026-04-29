@@ -28,5 +28,7 @@ class AgentState(MessagesState):
     # research step
     market_report: Annotated[str, "Report from the Market Analyst"]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
+    news_report: Annotated[str, "Report from the News Analyst"]
+    confidence_rationale: Annotated[dict, "Per-horizon confidence rationale from News Analyst"]
 
     composite_signal: Annotated[str, "JSON-serialized CompositeSignal from Synthesis Agent"]

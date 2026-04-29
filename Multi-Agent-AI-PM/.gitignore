@@ -221,5 +221,6 @@ cli/.saved_config.json
 # Cache
 **/data_cache/
 
- eval_results
+eval_results/
 results/
+backtest_results/

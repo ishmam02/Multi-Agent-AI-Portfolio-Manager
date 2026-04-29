@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class AgentType(str, Enum):
     FUNDAMENTAL = "fundamental"
     MARKET = "market"
+    NEWS = "news"
 
 
 class Metrics(BaseModel):
@@ -39,15 +40,19 @@ class ComputationTrace(BaseModel):
 class Catalyst(BaseModel):
     catalyst: str
     term: str  # "long_term" | "medium_term" | "short_term"
-    metric_name: str
-    computation_trace_id: str
+    metric_name: str = ""  # code-computed analysts: the supporting metric
+    computation_trace_id: str = ""  # code-computed analysts: trace UUID
+    claim: str = ""  # news analyst: the supporting claim text
+    source_uuid: str = ""  # news analyst: links to citation_chain source_uuid
 
 
 class Risk(BaseModel):
     risk: str
     term: str  # "long_term" | "medium_term" | "short_term"
-    metric_name: str
-    computation_trace_id: str
+    metric_name: str = ""  # code-computed analysts: the supporting metric
+    computation_trace_id: str = ""  # code-computed analysts: trace UUID
+    claim: str = ""  # news analyst: the supporting claim text
+    source_uuid: str = ""  # news analyst: links to citation_chain source_uuid
 
 
 class Citation(BaseModel):
@@ -95,9 +100,9 @@ class ResearchReport(BaseModel):
 
     # ── Phase 2: Symbolic (Code-Computed Numerics) ──
     mu: HorizonValues  # Expected return per horizon
-    mu_trace_id: HorizonTraceIds  # Trace UUIDs for mu per horizon
+    mu_trace_id: HorizonTraceIds | None = None  # Trace UUIDs for mu per horizon
     sigma_contribution: HorizonValues  # Volatility contribution per horizon
-    sigma_trace_id: HorizonTraceIds  # Trace UUIDs for sigma_contribution per horizon
+    sigma_trace_id: HorizonTraceIds | None = None  # Trace UUIDs for sigma_contribution per horizon
     computed_metrics: List[ComputedMetric]  # Flexible list, not fixed dict
 
     # ── Phase 3: Investment Thesis (LLM interprets Phase 2 results) ──
@@ -118,8 +123,9 @@ class ResearchReport(BaseModel):
 class AnalystWeights(BaseModel):
     """Per-analyst weights for a single horizon. Must sum to 1.0 (enforced in code)."""
 
-    fundamental: float = 0.5
-    market: float = 0.5
+    fundamental: float = 0.333
+    market: float = 0.333
+    news: float = 0.334
 
 
 class HorizonWeights(BaseModel):

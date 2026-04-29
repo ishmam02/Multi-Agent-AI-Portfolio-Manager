@@ -748,14 +748,16 @@ def display_complete_report(final_state):
 
 
 # Ordered list of analysts for status transitions
-ANALYST_ORDER = ["market", "fundamentals"]
+ANALYST_ORDER = ["market", "fundamentals", "news"]
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
     "fundamentals": "Fundamentals Analyst",
+    "news": "News Analyst",
 }
 ANALYST_REPORT_MAP = {
     "market": "market_report",
     "fundamentals": "fundamentals_report",
+    "news": "news_report",
 }
 
 

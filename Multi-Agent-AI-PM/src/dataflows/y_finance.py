@@ -111,7 +111,7 @@ def get_balance_sheet(
         if data.empty:
             return f"No balance sheet data found for symbol '{ticker}'"
 
-        return data.to_csv()
+        return data.to_csv(index_label="Metric")
         
     except Exception as e:
         return f"Error retrieving balance sheet for {ticker}: {str(e)}"
@@ -134,7 +134,7 @@ def get_cashflow(
         if data.empty:
             return f"No cash flow data found for symbol '{ticker}'"
 
-        return data.to_csv()
+        return data.to_csv(index_label="Metric")
         
     except Exception as e:
         return f"Error retrieving cash flow for {ticker}: {str(e)}"
@@ -157,7 +157,7 @@ def get_income_statement(
         if data.empty:
             return f"No income statement data found for symbol '{ticker}'"
 
-        return data.to_csv()
+        return data.to_csv(index_label="Metric")
         
     except Exception as e:
         return f"Error retrieving income statement for {ticker}: {str(e)}"
