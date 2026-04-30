@@ -17,7 +17,7 @@ import logging
 import pathlib
 import statistics
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
 # ── Ensure project root is on path ────────────────────────────────────────────
@@ -219,7 +219,6 @@ def _run_analysts_once(
     trade_date: str,
     depth: str,
     horizons: tuple[str, ...],
-    workers: int = 3,
 ) -> dict:
     """Run all three analysts once in parallel and return a state dict with real reports.
 
@@ -232,25 +231,23 @@ def _run_analysts_once(
     # Build code agents for market & fundamentals
     market_ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=300,
+        max_iterations=8,
         analyst_type="market",
         project_root=_project_root,
         verbose=False,
     )
     fundamentals_ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=300,
+        max_iterations=8,
         analyst_type="fundamental",
         project_root=_project_root,
         verbose=False,
     )
 
     # Build nodes
-    market_node = create_market_analyst(
-        llm, market_ca, depth, active_horizons=horizons
-    )
+    market_node = create_market_analyst(llm, market_ca, depth, active_horizons=horizons)
     fundamentals_node = create_fundamentals_analyst(
         llm, fundamentals_ca, depth, active_horizons=horizons
     )
@@ -285,22 +282,21 @@ def _run_analysts_once(
         except Exception as exc:
             return "news", None, exc
 
+    # Run analysts sequentially to avoid EDGAR thread-safety deadlocks
     reports: dict[str, str] = {}
     errors: dict[str, Exception] = {}
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_run_market): "market",
-            pool.submit(_run_fundamentals): "fundamentals",
-            pool.submit(_run_news): "news",
-        }
-        for fut in as_completed(futures):
-            analyst_key, report_json, err = fut.result()
-            if err:
-                errors[analyst_key] = err
-                _log.warning("%s analyst failed: %s", analyst_key, err)
-            else:
-                reports[analyst_key] = report_json
+    for _run_fn, key in [
+        (_run_market, "market"),
+        (_run_fundamentals, "fundamentals"),
+        (_run_news, "news"),
+    ]:
+        analyst_key, report_json, err = _run_fn()
+        if err:
+            errors[analyst_key] = err
+            _log.warning("%s analyst failed: %s", analyst_key, err)
+        else:
+            reports[analyst_key] = report_json
 
     # Build final state — use real reports where available, mock fallback otherwise
     state = {"company_of_interest": ticker, "trade_date": trade_date}
@@ -323,9 +319,29 @@ def _run_analysts_once(
     return state
 
 
-def _run_once(node, state: dict, run_idx: int, horizons: tuple[str, ...]) -> dict | None:
-    """Single synthesis run. Returns dict with composite metrics or error info."""
+def _run_once(
+    ticker: str,
+    trade_date: str,
+    depth: str,
+    horizons: tuple[str, ...],
+    seed: int,
+    run_idx: int,
+    state: dict,
+) -> dict | None:
+    """Single synthesis run. Creates LLM + node inside worker for pickle-safety.
+    Returns dict with composite metrics or error info.
+    """
     try:
+        llm = create_llm_client(
+            provider="ollama",
+            model="minimax-m2.7:cloud",
+            base_url="http://localhost:11434/v1",
+            max_retries=10,
+            reasoning_effort="high",
+            temperature=0,
+            seed=seed,
+        ).get_llm()
+        node = create_synthesis_agent(llm, horizons=horizons)
         result = node(state)
         raw_json = result.get("composite_signal", "{}")
         composite = CompositeSignal.model_validate_json(raw_json)
@@ -421,7 +437,9 @@ def _print_summary(results: list[dict], num_runs: int, horizons: tuple[str, ...]
     print(f"\n{'-' * 60}")
     print("  CONFLICTS & PENALTIES")
     print(f"{'-' * 60}")
-    _print_metric_block("unresolved_penalty", [r["unresolved_penalty"] for r in results])
+    _print_metric_block(
+        "unresolved_penalty", [r["unresolved_penalty"] for r in results]
+    )
     _print_metric_block("conflict_count", [float(r["conflicts"]) for r in results])
 
     # ── Pretty-print first successful composite ──────────────────────────
@@ -472,7 +490,9 @@ def _print_summary(results: list[dict], num_runs: int, horizons: tuple[str, ...]
 
     print(f"  conflicts        : {len(comp.cross_signal_conflicts)}")
     for c in comp.cross_signal_conflicts:
-        print(f"    • [{c.horizon}] {c.analyst_a.value} vs {c.analyst_b.value}: {c.conflict_description[:60]}...")
+        print(
+            f"    • [{c.horizon}] {c.analyst_a.value} vs {c.analyst_b.value}: {c.conflict_description[:60]}..."
+        )
     print(f"  rationale        : {comp.weighting_rationale[:120]}...")
     print(f"{'=' * 60}")
     print("\nFull JSON of run 1:")
@@ -494,7 +514,9 @@ def _print_metric_block(label: str, vals: list[float]):
     )
 
 
-def _format_run_line(res: dict, run_idx: int, total: int, horizons: tuple[str, ...]) -> str:
+def _format_run_line(
+    res: dict, run_idx: int, total: int, horizons: tuple[str, ...]
+) -> str:
     """Format a single run result line, showing only selected horizons."""
     parts = [f"  Run {run_idx:02d}/{total}  OK"]
     mu_parts = []
@@ -521,8 +543,15 @@ def main():
         "--depth", default="shallow", choices=["shallow", "medium", "deep"]
     )
     parser.add_argument("--runs", type=int, default=10, help="Number of synthesis runs")
-    parser.add_argument("--workers", type=int, default=4, help="Max parallel synthesis workers")
+    parser.add_argument(
+        "--workers", type=int, default=4, help="Max parallel synthesis workers"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for LLM")
+    parser.add_argument(
+        "--output",
+        default="experiment_results/deviation_synthesis.json",
+        help="JSON output path",
+    )
     parser.add_argument(
         "--horizons",
         default="long,medium,short",
@@ -547,25 +576,33 @@ def main():
     # ── Phase 1: Run all three analysts once for real ──────────────────────
     _log.info(
         "Running analysts once (depth=%s) for %s @ %s ...",
-        args.depth, args.ticker, args.date,
+        args.depth,
+        args.ticker,
+        args.date,
     )
     synthesis_state = _run_analysts_once(
-        llm, args.ticker, args.date, args.depth, horizons, workers=3
+        llm, args.ticker, args.date, args.depth, horizons
     )
 
-    # ── Phase 2: Build synthesis node and run N times ──────────────────────
-    _log.info("Building synthesis (trader) node ...")
-    node = create_synthesis_agent(llm, horizons=horizons)
-
+    # ── Phase 2: Run synthesis N times (node built inside each worker) ────
     _log.info(
         "Running %d syntheses in parallel (max_workers=%d) ...",
         args.runs,
         args.workers,
     )
     results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(_run_once, node, synthesis_state, i, horizons): i
+            pool.submit(
+                _run_once,
+                args.ticker,
+                args.date,
+                args.depth,
+                horizons,
+                args.seed,
+                i,
+                synthesis_state,
+            ): i
             for i in range(1, args.runs + 1)
         }
         for fut in as_completed(futures):
@@ -579,6 +616,27 @@ def main():
 
     _print_summary(results, args.runs, horizons)
     print("\nDone.")
+
+    # ── Save structured results ────────────────────────────────────────────
+    pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    serializable_results = []
+    for r in results:
+        d = {k: v for k, v in r.items() if k != "composite"}
+        serializable_results.append(d)
+    summary = {
+        "test_type": "deviation",
+        "analyst": "synthesis",
+        "ticker": args.ticker,
+        "date": args.date,
+        "depth": args.depth,
+        "runs_requested": args.runs,
+        "runs_successful": len(results),
+        "horizons": list(horizons),
+        "results": serializable_results,
+    }
+    with open(args.output, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"Results saved to: {args.output}")
 
 
 if __name__ == "__main__":

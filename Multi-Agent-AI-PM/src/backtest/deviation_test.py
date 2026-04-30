@@ -11,11 +11,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import pathlib
 import statistics
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ── Ensure project root is on path ────────────────────────────────────────────
 _project_root = str(pathlib.Path(__file__).resolve().parents[2])
@@ -66,8 +67,8 @@ def _build_node(analyst: str, llm, depth: str, active_horizons: tuple[str, ...])
 
     ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=300,
+        max_iterations=8,
         analyst_type=analyst,
         project_root=_project_root,
         verbose=False,
@@ -94,9 +95,28 @@ def _report_key(analyst: str) -> str:
     }[analyst]
 
 
-def _run_once(node, state: dict, run_idx: int, analyst: str) -> dict | None:
-    """Single analysis run.  Returns dict with metrics or error info."""
+def _run_once(
+    analyst: str,
+    depth: str,
+    active_horizons: tuple[str, ...],
+    ticker: str,
+    trade_date: str,
+    seed: int,
+    run_idx: int,
+) -> dict | None:
+    """Single analysis run with its own isolated node + LLM."""
     try:
+        llm = create_llm_client(
+            provider="ollama",
+            model="minimax-m2.7:cloud",
+            base_url="http://localhost:11434/v1",
+            max_retries=10,
+            reasoning_effort="high",
+            temperature=0,
+            seed=seed,
+        ).get_llm()
+        node = _build_node(analyst, llm, depth, active_horizons)
+        state = {"company_of_interest": ticker, "trade_date": trade_date}
         result = node(state)
         raw_json = result.get(_report_key(analyst), "{}")
         report = ResearchReport.model_validate_json(raw_json)
@@ -270,6 +290,11 @@ def main():
     parser.add_argument("--workers", type=int, default=10, help="Max parallel workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for LLM")
     parser.add_argument(
+        "--output",
+        default=None,
+        help="JSON output path (default: experiment_results/deviation_<analyst>.json)",
+    )
+    parser.add_argument(
         "--horizons",
         default="long,medium,short",
         help="Comma-separated horizons to evaluate (long,medium,short)",
@@ -279,30 +304,24 @@ def main():
     active_horizons = _parse_horizons(args.horizons)
     _log.info("Active horizons: %s", active_horizons)
 
-    _log.info("Creating LLM client …")
-    llm = create_llm_client(
-        provider="ollama",
-        model="minimax-m2.7:cloud",
-        base_url="http://localhost:11434/v1",
-        max_retries=10,
-        reasoning_effort="high",
-        temperature=0,
-        seed=args.seed,
-    ).get_llm()
-
-    _log.info("Building %s analyst node (depth=%s) …", args.analyst, args.depth)
-    node = _build_node(args.analyst, llm, args.depth, active_horizons)
-    init_state = {"company_of_interest": args.ticker, "trade_date": args.date}
-
     _log.info(
         "Running %d analyses in parallel (max_workers=%d) …",
         args.runs,
         args.workers,
     )
     results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(_run_once, node, init_state, i, args.analyst): i
+            pool.submit(
+                _run_once,
+                args.analyst,
+                args.depth,
+                active_horizons,
+                args.ticker,
+                args.date,
+                args.seed,
+                i,
+            ): i
             for i in range(1, args.runs + 1)
         }
         for fut in as_completed(futures):
@@ -316,6 +335,28 @@ def main():
 
     _print_summary(results, args.ticker, args.date, args.runs, active_horizons)
     print("\nDone.")
+
+    # ── Save structured results ────────────────────────────────────────────
+    out_path = args.output or f"experiment_results/deviation_{args.analyst}.json"
+    pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    serializable_results = []
+    for r in results:
+        d = {k: v for k, v in r.items() if k not in ("report", "extra")}
+        serializable_results.append(d)
+    summary = {
+        "test_type": "deviation",
+        "analyst": args.analyst,
+        "ticker": args.ticker,
+        "date": args.date,
+        "depth": args.depth,
+        "runs_requested": args.runs,
+        "runs_successful": len(results),
+        "horizons": list(active_horizons),
+        "results": serializable_results,
+    }
+    with open(out_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"Results saved to: {out_path}")
 
 
 if __name__ == "__main__":

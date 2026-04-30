@@ -19,7 +19,7 @@ import statistics
 import sys
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,12 +37,12 @@ from src.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 # ── Regime definitions (label, start, end, samples) ──────────────────────────
 DEFAULT_REGIMES: List[Tuple[str, str, str, int]] = [
     ("Post-GFC recovery", "2010-01-01", "2013-12-31", 8),
-    ("Mid bull", "2014-01-01", "2017-12-31", 10),
+    ("Mid bull", "2014-01-01", "2017-12-31", 8),
     ("Volatile / trade war", "2018-01-01", "2019-12-31", 8),
     ("COVID crash", "2020-02-15", "2020-03-31", 4),
-    ("Recovery bull", "2020-04-01", "2021-12-31", 10),
+    ("Recovery bull", "2020-04-01", "2021-12-31", 8),
     ("2022 bear", "2022-01-01", "2022-10-31", 8),
-    ("Post-bear bull", "2022-11-01", "2024-12-01", 12),
+    ("Post-bear bull", "2022-11-01", "2024-12-01", 4),
 ]
 
 # Forward horizons in trading days (must line up with graph horizons)
@@ -79,6 +79,9 @@ class BacktestResult:
     fundamentals_mu_long: Optional[float] = None
     fundamentals_mu_medium: Optional[float] = None
     fundamentals_mu_short: Optional[float] = None
+    news_mu_long: Optional[float] = None
+    news_mu_medium: Optional[float] = None
+    news_mu_short: Optional[float] = None
 
     # Error tracking
     error: Optional[str] = None
@@ -166,7 +169,7 @@ def run_single(
     try:
         # Each thread gets its own graph instance to avoid shared-state issues
         graph = TradingAgentsGraph(
-            selected_analysts=["market", "fundamentals"],
+            selected_analysts=["market", "fundamentals", "news"],
             config=config,
             debug=False,
         )
@@ -228,6 +231,19 @@ def run_single(
         except Exception:
             pass
 
+    news_mu_long = None
+    news_mu_medium = None
+    news_mu_short = None
+    news_json = final_state.get("news_report", "")
+    if news_json:
+        try:
+            nr = ResearchReport.model_validate_json(news_json)
+            news_mu_long = nr.mu.long_term
+            news_mu_medium = nr.mu.medium_term
+            news_mu_short = nr.mu.short_term
+        except Exception:
+            pass
+
     result = BacktestResult(
         date=trade_date,
         regime=regime,
@@ -245,6 +261,9 @@ def run_single(
         fundamentals_mu_long=fundamentals_mu_long,
         fundamentals_mu_medium=fundamentals_mu_medium,
         fundamentals_mu_short=fundamentals_mu_short,
+        news_mu_long=news_mu_long,
+        news_mu_medium=news_mu_medium,
+        news_mu_short=news_mu_short,
     )
     return result, final_state
 
@@ -364,6 +383,7 @@ def report(results: List[BacktestResult]):
     for analyst_label, mu_attr in [
         ("Market", "market_mu_long"),
         ("Fundamentals", "fundamentals_mu_long"),
+        ("News", "news_mu_long"),
     ]:
         valid = [
             r for r in successes
@@ -432,6 +452,7 @@ def _save_csv(results: List[BacktestResult], path: str) -> None:
         "actual_ret_short", "actual_ret_medium", "actual_ret_long",
         "market_mu_long", "market_mu_medium", "market_mu_short",
         "fundamentals_mu_long", "fundamentals_mu_medium", "fundamentals_mu_short",
+        "news_mu_long", "news_mu_medium", "news_mu_short",
         "error",
     ]
     with open(path, "w", newline="") as f:
@@ -569,7 +590,7 @@ def main():
         )
 
     print(f"Running backtest with max {args.workers} concurrent workers ...")
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
         for d in dates:
             executor.submit(_run_one, d)
 

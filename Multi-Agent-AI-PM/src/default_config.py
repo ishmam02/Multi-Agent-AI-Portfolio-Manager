@@ -20,17 +20,17 @@ DEFAULT_CONFIG = {
     # Code agent settings
     "code_agent_model": "minimax-m2.7:cloud",
     "code_agent_base_url": "http://localhost:11434",
-    "code_agent_timeout": 60,
-    "code_agent_max_iterations": 5,
+    "code_agent_timeout": 300,
+    "code_agent_max_iterations": 8,
     # Research depth and horizons
     "research_depth": "shallow",
     "horizons_enabled": ["long_term", "medium_term", "short_term"],
-    "horizon_lookback": {"long_term": 365, "medium_term": 90, "short_term": 10},
+    "horizon_lookback": {"long_term": 1460, "medium_term": 360, "short_term": 120},
     # Cross-ticker covariance default correlation
     "cross_ticker_correlation": 0.3,
     # Graph execution settings
     "max_recur_limit": 100,
-    "max_concurrent_tickers": 5,
+    "max_concurrent_tickers": 3,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {

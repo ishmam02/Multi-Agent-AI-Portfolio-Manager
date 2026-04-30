@@ -112,7 +112,9 @@ def _default_equal_weights(horizons: tuple) -> dict:
     return {h: {"fundamental": eq, "market": eq, "news": eq} for h in horizons}
 
 
-def _compute_base_weights(reports: Dict[AgentType, ResearchReport], horizons: tuple) -> dict:
+def _compute_base_weights(
+    reports: Dict[AgentType, ResearchReport], horizons: tuple
+) -> dict:
     """
     Heuristic base weights proportional to each analyst's average conviction.
     Fully deterministic fallback when LLM consensus is unstable.
@@ -168,7 +170,9 @@ def _reports_json(
         ):
             entry[field] = {h: getattr(src, h, 0.0) for h in horizons}
         entry["mu_trace_id"] = {h: getattr(report.mu_trace_id, h, "") for h in horizons}
-        entry["sigma_trace_id"] = {h: getattr(report.sigma_trace_id, h, "") for h in horizons}
+        entry["sigma_trace_id"] = {
+            h: getattr(report.sigma_trace_id, h, "") for h in horizons
+        }
         entry["key_catalysts"] = [
             {
                 "catalyst": c.catalyst,
@@ -250,10 +254,18 @@ Output ONLY the JSON object. No markdown fences, no extra text."""
 
     collected: List[dict] = []
     for _ in range(samples):
-        result = llm.invoke([
-            SystemMessage(content="You are a senior portfolio manager synthesizing multi-analyst research."),
-            HumanMessage(content=phase1_prompt.format(reports_json=json.dumps(reports_json, indent=2))),
-        ])
+        result = llm.invoke(
+            [
+                SystemMessage(
+                    content="You are a senior portfolio manager synthesizing multi-analyst research."
+                ),
+                HumanMessage(
+                    content=phase1_prompt.format(
+                        reports_json=json.dumps(reports_json, indent=2)
+                    )
+                ),
+            ]
+        )
         parsed = _extract_json_block(result.content)
         if isinstance(parsed, dict) and "weights" in parsed:
             collected.append(parsed)
@@ -271,11 +283,18 @@ def _consensus_weights(
     Falls back to base_weights if sample std > threshold.
     """
     if not samples:
-        return base_weights, {h: round(1.0 / len(horizons), 2) for h in horizons}, "Fallback to base weights — no LLM samples succeeded.", True
+        return (
+            base_weights,
+            {h: round(1.0 / len(horizons), 2) for h in horizons},
+            "Fallback to base weights — no LLM samples succeeded.",
+            True,
+        )
 
     # Collect per-horizon, per-analyst weight lists
     analyst_keys = ["fundamental", "market", "news"]
-    weight_samples: Dict[str, Dict[str, List[float]]] = {h: {k: [] for k in analyst_keys} for h in horizons}
+    weight_samples: Dict[str, Dict[str, List[float]]] = {
+        h: {k: [] for k in analyst_keys} for h in horizons
+    }
     blend_samples: Dict[str, List[float]] = {h: [] for h in horizons}
     rationales: List[str] = []
 
@@ -321,7 +340,9 @@ def _consensus_weights(
     median_blend: dict = {}
     for h in horizons:
         vals = blend_samples[h]
-        median_blend[h] = statistics.median(vals) if vals else round(1.0 / len(horizons), 2)
+        median_blend[h] = (
+            statistics.median(vals) if vals else round(1.0 / len(horizons), 2)
+        )
     total_blend = sum(median_blend.values())
     if total_blend > 0:
         median_blend = {k: v / total_blend for k, v in median_blend.items()}
@@ -341,7 +362,9 @@ def _consensus_weights(
     else:
         weights_out = median_weights
         blend_out = median_blend
-        rationale = "Consensus LLM weights. " + " | ".join(r for r in rationales if r)[:300]
+        rationale = (
+            "Consensus LLM weights. " + " | ".join(r for r in rationales if r)[:300]
+        )
 
     return weights_out, blend_out, rationale, used_fallback
 
@@ -368,10 +391,14 @@ Your task: identify biases in the PM's weighting.
 Respond with a concise critique (2-4 sentences). Be specific about which analyst/horizon needs adjustment and why.
 Output ONLY plain text. No markdown fences, no JSON."""
 
-    result = llm.invoke([
-        SystemMessage(content="You are a senior risk officer reviewing analyst weight assignments."),
-        HumanMessage(content=critique_prompt),
-    ])
+    result = llm.invoke(
+        [
+            SystemMessage(
+                content="You are a senior risk officer reviewing analyst weight assignments."
+            ),
+            HumanMessage(content=critique_prompt),
+        ]
+    )
     return str(result.content or "").strip()
 
 
@@ -419,10 +446,14 @@ Respond with a single JSON object in this exact structure:
 
 Output ONLY the JSON object. No markdown fences, no extra text."""
 
-    result = llm.invoke([
-        SystemMessage(content="You are a senior portfolio manager refining analyst weights."),
-        HumanMessage(content=refine_prompt),
-    ])
+    result = llm.invoke(
+        [
+            SystemMessage(
+                content="You are a senior portfolio manager refining analyst weights."
+            ),
+            HumanMessage(content=refine_prompt),
+        ]
+    )
     parsed = _extract_json_block(result.content)
 
     if isinstance(parsed, dict) and "weights" in parsed:
@@ -434,14 +465,25 @@ Output ONLY the JSON object. No markdown fences, no extra text."""
         else:
             weights = consensus_weights
         if isinstance(raw_blend, dict):
-            blend_vals = {h: float(raw_blend.get(h, round(1.0 / len(horizons), 2))) for h in horizons}
+            blend_vals = {
+                h: float(raw_blend.get(h, round(1.0 / len(horizons), 2)))
+                for h in horizons
+            }
             total = sum(blend_vals.values())
-            blend = {k: v / total for k, v in blend_vals.items()} if total > 0 else {h: round(1.0 / len(horizons), 2) for h in horizons}
+            blend = (
+                {k: v / total for k, v in blend_vals.items()}
+                if total > 0
+                else {h: round(1.0 / len(horizons), 2) for h in horizons}
+            )
         else:
             blend = {h: round(1.0 / len(horizons), 2) for h in horizons}
         return weights, blend, rationale
 
-    return consensus_weights, {h: round(1.0 / len(horizons), 2) for h in horizons}, "Refinement failed; keeping consensus."
+    return (
+        consensus_weights,
+        {h: round(1.0 / len(horizons), 2) for h in horizons},
+        "Refinement failed; keeping consensus.",
+    )
 
 
 # ── Phase 2: Deterministic Conflict Detection + LLM Labelling ────────────────
@@ -459,7 +501,7 @@ def _detect_conflicts(
     analyst_list = list(reports.keys())
     conflicts = []
     for i, a_type in enumerate(analyst_list):
-        for b_type in analyst_list[i + 1:]:
+        for b_type in analyst_list[i + 1 :]:
             for h in horizons:
                 mu_a = getattr(reports[a_type].mu, h, 0.0)
                 mu_b = getattr(reports[b_type].mu, h, 0.0)
@@ -476,15 +518,17 @@ def _detect_conflicts(
                 sigma_divergence = sigma_ratio > 2.0
 
                 if (sign_disagree and relative_gap > threshold) or sigma_divergence:
-                    conflicts.append({
-                        "analyst_a": AGENT_TYPE_KEYS.get(a_type, a_type.value),
-                        "analyst_b": AGENT_TYPE_KEYS.get(b_type, b_type.value),
-                        "horizon": h,
-                        "mu_a": mu_a,
-                        "mu_b": mu_b,
-                        "sigma_a": sigma_a,
-                        "sigma_b": sigma_b,
-                    })
+                    conflicts.append(
+                        {
+                            "analyst_a": AGENT_TYPE_KEYS.get(a_type, a_type.value),
+                            "analyst_b": AGENT_TYPE_KEYS.get(b_type, b_type.value),
+                            "horizon": h,
+                            "mu_a": mu_a,
+                            "mu_b": mu_b,
+                            "sigma_a": sigma_a,
+                            "sigma_b": sigma_b,
+                        }
+                    )
     return conflicts
 
 
@@ -527,10 +571,14 @@ Respond with a single JSON object:
 If no contradictions exist, return {{"conflicts": []}}.
 Output ONLY the JSON object. No markdown fences, no extra text."""
 
-    result = llm.invoke([
-        SystemMessage(content="You are a risk analyst reviewing multi-analyst research for contradictions."),
-        HumanMessage(content=label_prompt),
-    ])
+    result = llm.invoke(
+        [
+            SystemMessage(
+                content="You are a risk analyst reviewing multi-analyst research for contradictions."
+            ),
+            HumanMessage(content=label_prompt),
+        ]
+    )
     parsed = _extract_json_block(result.content)
 
     conflicts: List[CrossSignalConflict] = []
@@ -563,7 +611,11 @@ Output ONLY the JSON object. No markdown fences, no extra text."""
 
 
 def _generate_thesis(
-    llm, reports_json: list, weights_dict: dict, conflicts: List[CrossSignalConflict], horizons: tuple
+    llm,
+    reports_json: list,
+    weights_dict: dict,
+    conflicts: List[CrossSignalConflict],
+    horizons: tuple,
 ) -> dict:
     """Generate unified investment thesis per horizon. Purely narrative."""
     horizon_names = _build_horizon_list(horizons)
@@ -596,10 +648,14 @@ Respond with a single JSON object:
 If a horizon has no signal, return an empty string for that horizon.
 Output ONLY the JSON object. No markdown fences, no extra text."""
 
-    result = llm.invoke([
-        SystemMessage(content="You are a senior portfolio manager writing a unified investment thesis."),
-        HumanMessage(content=thesis_prompt),
-    ])
+    result = llm.invoke(
+        [
+            SystemMessage(
+                content="You are a senior portfolio manager writing a unified investment thesis."
+            ),
+            HumanMessage(content=thesis_prompt),
+        ]
+    )
     parsed = _extract_json_block(result.content)
     _composite_thesis = {h: "" for h in ("long_term", "medium_term", "short_term")}
     if isinstance(parsed, dict):
@@ -748,7 +804,9 @@ def create_synthesis_agent(
         # Conviction: scaled by final mu magnitude, reduced by unresolved penalties
         raw_conviction = abs(mu_final)
         effective_penalty = min(unresolved_penalty, 0.5)
-        conviction_final = max(0.0, min(1.0, raw_conviction * (1.0 - effective_penalty)))
+        conviction_final = max(
+            0.0, min(1.0, raw_conviction * (1.0 - effective_penalty))
+        )
 
         # Validate weight sums
         weights_ok = all(
@@ -852,16 +910,16 @@ if __name__ == "__main__":
     # ── Create analyst code agents ────────────────────────────────────────────
     market_code_agent = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=300,
+        max_iterations=8,
         analyst_type="market",
         project_root=_project_root,
         verbose=True,
     )
     fundamentals_code_agent = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=300,
+        max_iterations=8,
         analyst_type="fundamental",
         project_root=_project_root,
         verbose=True,
@@ -873,7 +931,10 @@ if __name__ == "__main__":
         reasoning_llm, market_code_agent, RESEARCH_DEPTH, active_horizons=_HORIZONS
     )
     fundamentals_node = create_fundamentals_analyst(
-        reasoning_llm, fundamentals_code_agent, RESEARCH_DEPTH, active_horizons=_HORIZONS
+        reasoning_llm,
+        fundamentals_code_agent,
+        RESEARCH_DEPTH,
+        active_horizons=_HORIZONS,
     )
 
     init_state = {
@@ -894,7 +955,9 @@ if __name__ == "__main__":
         report_json = result.get("market_report", "{}")
         try:
             report = ResearchReport.model_validate_json(report_json)
-            print(f"  [Market] done — mu={report.mu.long_term:+.4f}, conviction={report.conviction.long_term:.2f}")
+            print(
+                f"  [Market] done — mu={report.mu.long_term:+.4f}, conviction={report.conviction.long_term:.2f}"
+            )
             return "market", report_json, report
         except Exception as exc:
             print(f"  [Market] WARNING: Failed to parse report: {exc}")
@@ -906,7 +969,9 @@ if __name__ == "__main__":
         report_json = result.get("fundamentals_report", "{}")
         try:
             report = ResearchReport.model_validate_json(report_json)
-            print(f"  [Fundamentals] done — mu={report.mu.long_term:+.4f}, conviction={report.conviction.long_term:.2f}")
+            print(
+                f"  [Fundamentals] done — mu={report.mu.long_term:+.4f}, conviction={report.conviction.long_term:.2f}"
+            )
             return "fundamentals", report_json, report
         except Exception as exc:
             print(f"  [Fundamentals] WARNING: Failed to parse report: {exc}")
@@ -960,9 +1025,15 @@ if __name__ == "__main__":
     print(f"sigma_final   = {composite.sigma_final:.4f}")
     print(f"conviction    = {composite.conviction_final:.4f}")
     print(f"rationale     = {composite.weighting_rationale}")
-    print(f"\ncomposite thesis (long_term):  {composite.composite_thesis.long_term[:200]}...")
-    print(f"composite thesis (medium_term): {composite.composite_thesis.medium_term[:200]}...")
-    print(f"composite thesis (short_term): {composite.composite_thesis.short_term[:200]}...")
+    print(
+        f"\ncomposite thesis (long_term):  {composite.composite_thesis.long_term[:200]}..."
+    )
+    print(
+        f"composite thesis (medium_term): {composite.composite_thesis.medium_term[:200]}..."
+    )
+    print(
+        f"composite thesis (short_term): {composite.composite_thesis.short_term[:200]}..."
+    )
     print(f"conflicts     = {len(composite.cross_signal_conflicts)}")
     print(f"source_reports= {composite.source_reports}")
     print(f"{'=' * 60}")

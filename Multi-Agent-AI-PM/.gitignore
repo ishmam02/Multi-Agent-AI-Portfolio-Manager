@@ -224,3 +224,4 @@ cli/.saved_config.json
 eval_results/
 results/
 backtest_results/
+experiment_results/

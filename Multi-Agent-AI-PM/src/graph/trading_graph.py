@@ -102,8 +102,8 @@ class TradingAgentsGraph:
             ca_type = _analyst_type_map.get(analyst_key, "fundamental")
             self.code_agents[analyst_key] = CodeValidationAgent(
                 model=self.config.get("code_agent_model", "kimi-k2.5:cloud"),
-                timeout=self.config.get("code_agent_timeout", 60),
-                max_iterations=self.config.get("code_agent_max_iterations", 5),
+                timeout=self.config.get("code_agent_timeout", 300),
+                max_iterations=self.config.get("code_agent_max_iterations", 8),
                 analyst_type=ca_type,
             )
 
@@ -116,7 +116,11 @@ class TradingAgentsGraph:
             code_agents=self.code_agents,
             quick_thinking_llm=self.quick_thinking_llm,
             research_depth=self.config.get("research_depth", "medium"),
-            horizons=tuple(self.config.get("horizons_enabled", ["long_term", "medium_term", "short_term"])),
+            horizons=tuple(
+                self.config.get(
+                    "horizons_enabled", ["long_term", "medium_term", "short_term"]
+                )
+            ),
         )
 
         self.propagator = Propagator()

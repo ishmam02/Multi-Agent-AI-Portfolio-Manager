@@ -3,19 +3,19 @@
 ## HORIZON_FOCUS
 
 ### long_term
-HORIZON: Long-term (1+ years).
+HORIZON: Long-term (1+ years).  Lookback = 1460 days.
 Data source: All available fundamentals data.
 Forward return horizon = 252 trading days.
 Emphasis: DCF terminal value, secular growth trends, multi-cycle quality.
 
 ### medium_term
-HORIZON: Medium-term (3-12 months).
+HORIZON: Medium-term (3-12 months).  Lookback = 360 days.
 Data source: All available fundamentals data.
 Forward return horizon = 63 trading days.
 Emphasis: Earnings trajectory, near-term multiple re-rating, margin inflection.
 
 ### short_term
-HORIZON: Short-term (days to weeks).
+HORIZON: Short-term (next 12 trading days).  Lookback = 120 days.
 Data source: All available fundamentals data.
 Forward return horizon = 12 trading days.
 Emphasis: Earnings surprise risk, insider activity, near-term catalysts.

@@ -809,7 +809,8 @@ class CodeValidationAgent:
             proc = subprocess.run(
                 [sys.executable, script],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout,
                 cwd=work_dir,
             )
@@ -858,6 +859,7 @@ class CodeValidationAgent:
             analysis_date,
             self.analyst_type,
             work_dir_horizon,
+            uuid.uuid4().hex[:8],
         )
         os.makedirs(work_dir, exist_ok=True)
         self._current_work_dir = work_dir
@@ -1105,7 +1107,8 @@ class CodeValidationAgent:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     cwd=work_dir,
                 ) as proc:
                     try:
@@ -1114,8 +1117,11 @@ class CodeValidationAgent:
 
                         def _reader() -> None:
                             try:
-                                for raw in proc.stdout:
-                                    line_q.put(raw)
+                                for raw_bytes in proc.stdout:
+                                    if isinstance(raw_bytes, bytes):
+                                        line_q.put(raw_bytes.decode("utf-8", errors="replace"))
+                                    else:
+                                        line_q.put(raw_bytes)
                             finally:
                                 line_q.put(None)  # sentinel: EOF
 

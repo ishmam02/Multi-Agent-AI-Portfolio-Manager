@@ -160,7 +160,7 @@ def create_fundamentals_analyst(
 #     code_agent = CodeValidationAgent(
 #         model="minimax-m2.7:cloud",
 #         timeout=60,
-#         max_iterations=5,
+#         max_iterations=8,
 #         analyst_type="fundamental",
 #         project_root=_project_root,
 #         verbose=False,

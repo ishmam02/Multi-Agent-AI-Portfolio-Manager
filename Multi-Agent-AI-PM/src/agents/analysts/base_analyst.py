@@ -77,8 +77,9 @@ _loggers: Dict[str, logging.Logger] = {}
 def _get_file_logger(
     analyst_type: str, ticker: str, trade_date: str, horizon: str
 ) -> logging.Logger:
-    """Return (or create) a file logger for the given analyst/horizon combo."""
-    key = f"{analyst_type}|{ticker}|{trade_date}|{horizon}"
+    """Return (or create) a per-process file logger for the given analyst/horizon combo."""
+    pid = os.getpid()
+    key = f"{analyst_type}|{ticker}|{trade_date}|{horizon}|{pid}"
     if key in _loggers:
         return _loggers[key]
 
@@ -86,14 +87,14 @@ def _get_file_logger(
         _PROJECT_ROOT, "results", ticker, trade_date, analyst_type, horizon
     )
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "analyst.log")
+    log_path = os.path.join(log_dir, f"analyst_{pid}.log")
 
     logger = logging.getLogger(f"analyst.{key}")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     # Avoid duplicate handlers on repeated calls
     if not logger.handlers:
-        fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
         fh.setFormatter(
             logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
         )
@@ -1765,10 +1766,11 @@ def create_analyst_node(
             trade_date,
         )
 
-        # ── Log the final report to results/{ticker}/{date}/report.log ─────
+        # ── Log the final report to results/{ticker}/{date}/report_{uuid}.log ───
         report_log_dir = os.path.join(_PROJECT_ROOT, "results", ticker, trade_date)
         os.makedirs(report_log_dir, exist_ok=True)
-        report_log_path = os.path.join(report_log_dir, "report.log")
+        _run_uuid = uuid.uuid4().hex[:8]
+        report_log_path = os.path.join(report_log_dir, f"report_{_run_uuid}.log")
         with open(report_log_path, "a", encoding="utf-8") as f:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"\n{'=' * 60}\n")
