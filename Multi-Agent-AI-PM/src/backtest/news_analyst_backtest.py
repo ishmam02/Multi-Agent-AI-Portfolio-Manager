@@ -124,7 +124,16 @@ def _run_once(args: tuple, depth: str) -> dict:
     actual = (ep - sp) / sp
     try:
         node = _get_node(depth)
-        r = node({"company_of_interest": ticker, "trade_date": d})
+        regime_context = (
+            f"This date falls within the '{reg}' regime. "
+            "Calibrate your directional bias accordingly — bear-market dates require "
+            "heightened scrutiny of negative signals."
+        )
+        r = node({
+            "company_of_interest": ticker,
+            "trade_date": d,
+            "regime_context": regime_context,
+        })
         rep = ResearchReport.model_validate_json(r.get("news_report", "{}"))
         pred = rep.mu.long_term
         sigma = rep.sigma_contribution.long_term

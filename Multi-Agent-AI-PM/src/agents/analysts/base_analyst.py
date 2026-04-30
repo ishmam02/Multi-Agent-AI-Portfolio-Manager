@@ -21,7 +21,6 @@ provides its own:
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
 import os
@@ -202,14 +201,6 @@ class MetricPlanEntry(TypedDict):
     computation_instruction: str
 
 
-class ComputationPlanState(TypedDict):
-    computation_plan: List[MetricPlanEntry]
-    ticker: str
-    analysis_date: str
-    horizon: str
-    analyst_type: str
-
-
 class RawComputedMetricEntry(TypedDict):
     metric_name: str
     value: MetricValue
@@ -291,20 +282,21 @@ class HorizonOutput(TypedDict):
 class AnalystSubState(TypedDict):
     ticker: str
     trade_date: str
-    horizon: str  # "long_term" | "medium_term" | "short_term"
+    active_horizons: list[str]  # e.g. ["long_term", "medium_term", "short_term"]
     research_depth: str  # "shallow" | "medium" | "deep"
     gathered_data: Dict[str, GatheredEntry]
-    computation_plan: ComputationPlanState
     all_computed_metrics: List[ComputedMetric]  # accumulated across all passes
     all_computation_traces: List[ComputationTrace]  # accumulated across all passes
     all_metrics_selected: List[MetricPlanEntry]  # accumulated across all passes
     compute_result: CodeAgentResult  # this pass's code agent output
     code_succeeded: bool
     plan_revision_count: int  # max 2 plan revisions per pass
-    research_pass_count: int  # how many plan→compute→thesis passes done
+    research_pass_count: int  # how many compute→thesis passes done
     thesis: ThesisResult
+    thesis_by_horizon: Dict[str, ThesisResult]  # per-horizon thesis results
     needs_more_research: bool  # Phase 3 decision: loop back?
-    final_output: HorizonOutput
+    additional_instructions: str  # passed from Phase 3 back into Phase 2
+    final_outputs: Dict[str, HorizonOutput]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -570,6 +562,89 @@ def _parse_thesis_json(text: str) -> dict:
     return best_thesis or best_any or {}
 
 
+def _is_multi_horizon_thesis_json(d: dict) -> bool:
+    """True if *d* is a multi-horizon thesis object with per-horizon entries."""
+    if not isinstance(d, dict) or "horizons" not in d:
+        return False
+    horizons = d.get("horizons")
+    if not isinstance(horizons, dict):
+        return False
+    for h_data in horizons.values():
+        if not isinstance(h_data, dict):
+            return False
+        if not _THESIS_REQUIRED_KEYS.issubset(h_data):
+            return False
+        # Validate nested lists
+        vi = h_data.get("value_interpretations")
+        if vi is not None and not isinstance(vi, list):
+            return False
+        cats = h_data.get("key_catalysts")
+        if cats is not None and not isinstance(cats, list):
+            return False
+        risks = h_data.get("key_risks")
+        if risks is not None and not isinstance(risks, list):
+            return False
+    return True
+
+
+def _parse_multi_horizon_thesis_json(text: str) -> dict:
+    """Extract a multi-horizon thesis JSON from LLM output.
+
+    Returns a dict with keys:
+      horizons: dict[str, thesis_dict]
+      needs_more_research: bool
+      additional_metrics_needed: str
+    """
+    decoder = json.JSONDecoder()
+    stripped = text.strip()
+
+    # 1. Direct parse
+    if stripped.startswith("{"):
+        try:
+            d = json.loads(stripped)
+            if _is_multi_horizon_thesis_json(d):
+                return d
+        except json.JSONDecodeError:
+            pass
+        try:
+            d, _ = decoder.raw_decode(stripped, 0)
+            if _is_multi_horizon_thesis_json(d):
+                return d
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 2. Fenced code blocks
+    for m in re.finditer(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL):
+        try:
+            d = json.loads(m.group(1).strip())
+            if _is_multi_horizon_thesis_json(d):
+                return d
+        except json.JSONDecodeError:
+            continue
+
+    # 3. Forward scan — prefer multi-horizon thesis
+    best_mh: dict | None = None
+    best_mh_size = -1
+    best_any: dict | None = None
+    best_any_size = -1
+    for m in re.finditer(r"\{", text):
+        try:
+            d, _ = decoder.raw_decode(text, m.start())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        n = len(d)
+        if _is_multi_horizon_thesis_json(d) and n > best_mh_size:
+            best_mh = d
+            best_mh_size = n
+        if n > best_any_size:
+            best_any = d
+            best_any_size = n
+
+    return best_mh or best_any or {}
+
+
 def _coerce_value_interpretations(raw: object) -> List[ValueInterpretationEntry]:
     if not isinstance(raw, list):
         return []
@@ -660,7 +735,6 @@ def build_3phase_subgraph(
     code_agent    : CodeValidationAgent instance
     analyst_config : dict with keys:
         agent_type           : AgentType enum value
-        phase1_system_prompt : str
         phase2_system_prompt : str (domain prompt for the code agent)
         phase3_system_prompt : str
         gather_fn            : callable(ticker, trade_date, lookback) -> dict
@@ -670,7 +744,6 @@ def build_3phase_subgraph(
     Compiled LangGraph StateGraph
     """
     agent_type: AgentType = analyst_config["agent_type"]
-    phase1_prompt: str = analyst_config["phase1_system_prompt"]
     phase2_prompt: str | None = analyst_config.get("phase2_system_prompt")
     phase3_prompt: str = analyst_config["phase3_system_prompt"]
     gather_fn = analyst_config["gather_fn"]
@@ -681,15 +754,17 @@ def build_3phase_subgraph(
     def data_gathering(sub_state: AnalystSubState) -> dict:
         ticker = sub_state["ticker"]
         trade_date = sub_state["trade_date"]
-        horizon = sub_state["horizon"]
-        lookback = HORIZON_LOOKBACK[horizon]
+        active_horizons = sub_state["active_horizons"]
+        # Use the maximum lookback across all active horizons so the code agent
+        # has enough data to compute every horizon in a single pass.
+        max_lookback = max(HORIZON_LOOKBACK[h] for h in active_horizons)
         # Extend lookback by 300 trading days so the k-NN search space has
         # enough historical points with valid forward returns (t+h exists).
-        extended_lookback = lookback + 300
+        extended_lookback = max_lookback + 300
 
         _log(
-            f"{agent_type.value}|{ticker}|{horizon}",
-            f"data_gathering: horizon={horizon} lookback={lookback}d extended={extended_lookback}d",
+            f"{agent_type.value}|{ticker}|multi",
+            f"data_gathering: horizons={active_horizons} max_lookback={max_lookback}d extended={extended_lookback}d",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
@@ -708,7 +783,7 @@ def build_3phase_subgraph(
             sourced_data[key] = GatheredEntry(uuid=uid, data=val, headers=headers)
 
         _log(
-            f"{agent_type.value}|{ticker}|{horizon}",
+            f"{agent_type.value}|{ticker}|multi",
             f"data_gathering: collected {len(sourced_data)} data keys: {list(sourced_data.keys())}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -716,7 +791,7 @@ def build_3phase_subgraph(
             else "",
         )
         _log(
-            f"{agent_type.value}|{ticker}|{horizon}",
+            f"{agent_type.value}|{ticker}|multi",
             f"data_gathering: full gathered data:\n{json.dumps(sourced_data, indent=2)}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -726,238 +801,50 @@ def build_3phase_subgraph(
 
         return {"gathered_data": sourced_data}
 
-    # ── Node: phase1_plan ────────────────────────────────────────────────
-
-    def phase1_plan(sub_state: AnalystSubState) -> dict:
-        horizon = sub_state["horizon"]
-        gathered = sub_state["gathered_data"]
-        pass_count = sub_state["research_pass_count"]
-        revision_count = sub_state["plan_revision_count"]
-        code_ok = sub_state["code_succeeded"]
-
-        is_revision = revision_count > 0 and not code_ok
-
-        if not is_revision:
-            pass_count += 1
-
-        # Build system message
-        system_content = (
-            f"{phase1_prompt}\n\n{horizon_focus[horizon]}\n\n"
-            "You will also receive a company fundamentals snapshot in the user message.\n"
-            "If your system prompt defines a fundamental calibration workflow (e.g.\n"
-            "Step 1: classify fundamental profile, Step 2: select & parameterize\n"
-            "metrics using calibration rules, Step 3: structural validation), follow\n"
-            "that workflow. Otherwise, use the fundamentals to inform metric selection\n"
-            "(e.g. a high-dividend stock warrants dividend-adjusted returns; a\n"
-            "high-beta name needs wider vol estimates).\n"
-            "Do NOT compute fundamentals — they are context for planning only.\n\n"
-            "Your plan MUST include metrics that feed into mu and sigma:\n"
-            "  • A metric named 'signal_weighted_mu' whose computation_instruction\n"
-            "    explains how to aggregate the directional signals into mu.\n"
-            "  • A metric named 'regime_adjusted_sigma' whose computation_instruction\n"
-            "    explains how to derive sigma.\n\n"
-            "Return your plan as a JSON object with one key:\n"
-            '  "computation_plan": list of metric objects, each with:\n'
-            '    - "metric_name": str — unique name for this metric\n'
-            '    - "metric_interpretation": str — what this metric IS and what it measures\n'
-            '    - "metric_rationale": str — why this metric for this stock/horizon,\n'
-            "      including which calibration rules fired (if applicable)\n"
-            '    - "computation_instruction": str — detailed step-by-step computation\n'
-            "      instruction, specifying exact parameters influenced by calibration\n"
-            "\nReturn ONLY the JSON object, no other text."
-        )
-
-        # Build user message
-        user_parts = [
-            f"Ticker: {sub_state['ticker']}",
-            f"Trade Date: {sub_state['trade_date']}",
-            f"Horizon: {horizon}",
-            f"Research Pass: {pass_count}",
-        ]
-
-        # Show headers + first 3 data rows per key for context window management
-        preview_parts = []
-        for key, entry in gathered.items():
-            h = entry["headers"]
-            lines = entry["data"].splitlines()
-            data_rows = lines[1:4] if len(lines) > 1 else []
-            snippet = "\n".join([h] + data_rows) if h else "\n".join(data_rows)
-            preview_parts.append(f"[{key}]\n{snippet}")
-        user_parts.append("\n=== Gathered Data ===\n" + "\n\n".join(preview_parts))
-
-        # Fetch fundamentals snapshot to inform metric selection (Phase 1 only)
-        fundamentals_csv = get_fundamentals(sub_state["ticker"])
-        if isinstance(fundamentals_csv, str) and not fundamentals_csv.startswith(
-            "Error"
-        ):
-            user_parts.append(
-                f"\n=== Company Fundamentals (context only) ===\n{fundamentals_csv}"
-            )
-
-        if is_revision:
-            old_plan_str = json.dumps(
-                sub_state["computation_plan"], indent=2, default=str
-            )
-            compute_result_str = json.dumps(sub_state["compute_result"], default=str)
-            user_parts.append(
-                f"\n=== PLAN REVISION (attempt {revision_count}) ===\n"
-                f"The previous computation plan FAILED during code execution.\n"
-                f"\n--- Failed Plan ---\n{old_plan_str}\n"
-                f"\n--- Failed Compute Result ---\n{compute_result_str}\n\n"
-                "Please SIMPLIFY the computation plan. Remove metrics that are "
-                "too complex for the available data and simplify the instructions. "
-                "The code agent could not execute the previous plan."
-            )
-        elif pass_count > 1:
-            all_computed_str = json.dumps(
-                [m.model_dump() for m in sub_state["all_computed_metrics"]], indent=2
-            )
-            prior_thesis_str = json.dumps(sub_state["thesis"], indent=2)
-            user_parts.append(
-                f"\n=== Previously Computed Metrics (all passes) ===\n"
-                f"{all_computed_str[:5000]}\n"
-                f"\n=== Previous Thesis ===\n{prior_thesis_str[:3000]}\n\n"
-                "Plan ADDITIONAL metrics to fill gaps identified in the previous "
-                "thesis. Do NOT re-compute metrics already in the accumulated list."
-            )
-
-        sys_msg = SystemMessage(content=system_content)
-        user_msg = HumanMessage(content="\n".join(user_parts))
-
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan: invoking LLM  pass={pass_count} revision={is_revision}  system_chars={len(system_content)}  user_chars={len(user_msg.content)}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan LLM INPUT — system:\n{system_content}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan LLM INPUT — user:\n{user_msg.content}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-
-        result = reasoning_llm.invoke([sys_msg, user_msg])
-
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan: LLM responded  output_chars={len(result.content)}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan LLM OUTPUT (raw):\n{result.content}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-
-        plan = _parse_plan_json(result.content)
-
-        # Validate and coerce computation_plan entries to MetricPlanEntry
-        raw_metrics = plan.get("computation_plan", [])
-        if not isinstance(raw_metrics, list):
-            raw_metrics = []
-        validated_metrics: List[MetricPlanEntry] = []
-        for m in raw_metrics:
-            if isinstance(m, dict):
-                try:
-                    m.setdefault("term", horizon)
-                    validated = Metrics(**m).model_dump()
-                    validated_metrics.append(
-                        MetricPlanEntry(
-                            metric_name=validated["metric_name"],
-                            term=horizon,
-                            metric_interpretation=validated["metric_interpretation"],
-                            metric_rationale=validated["metric_rationale"],
-                            computation_instruction=validated[
-                                "computation_instruction"
-                            ],
-                        )
-                    )
-                except Exception:
-                    pass  # drop malformed entries
-
-        typed_plan = ComputationPlanState(
-            computation_plan=validated_metrics,
-            ticker=sub_state["ticker"],
-            analysis_date=sub_state["trade_date"],
-            horizon=horizon,
-            analyst_type=agent_type.value,
-        )
-
-        updates: Dict[str, object] = {"computation_plan": typed_plan}
-
-        if not is_revision:
-            all_selected = list(sub_state["all_metrics_selected"])
-            all_selected.extend(validated_metrics)
-            updates["all_metrics_selected"] = all_selected
-            updates["research_pass_count"] = pass_count
-
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan: pass={pass_count} revision={is_revision} total_metrics={len(validated_metrics)} metrics={[m['metric_name'] for m in validated_metrics]}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase1_plan: parsed plan JSON:\n{json.dumps(typed_plan, indent=2)}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-
-        return updates
-
     # ── Node: phase2_compute ─────────────────────────────────────────────
 
     def phase2_compute(sub_state: AnalystSubState) -> dict:
-        plan = sub_state["computation_plan"]
         sourced_data = sub_state["gathered_data"]
+        revision_count = sub_state["plan_revision_count"]
+        pass_count = sub_state["research_pass_count"] + 1
+        additional_instructions = sub_state.get("additional_instructions", "")
+        active_horizons = sub_state["active_horizons"]
 
         # Flatten sourced_data for code agent: strip UUIDs/headers, keep raw CSV
         flat_data: Dict[str, str] = {
             key: entry["data"] for key, entry in sourced_data.items()
         }
 
+        # Build the planning payload for the code agent.
+        # The code agent now analyses data, plans metrics, and writes code.
+        plan_payload = {
+            "ticker": sub_state["ticker"],
+            "analysis_date": sub_state["trade_date"],
+            "active_horizons": active_horizons,
+            "analyst_type": agent_type.value,
+            "research_pass": pass_count,
+            "revision_count": revision_count,
+            "additional_instructions": additional_instructions,
+        }
+
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase2_compute: executing code agent  metrics_planned={len(plan.get('computation_plan', []))}  data_keys={list(flat_data.keys())}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
+            f"phase2_compute: executing code agent  pass={pass_count} revision={revision_count}  data_keys={list(flat_data.keys())}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase2_compute INPUT — computation plan:\n{json.dumps(plan, indent=2)}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
+            f"phase2_compute INPUT — plan payload:\n{json.dumps(plan_payload, indent=2)}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase2_compute INPUT — domain prompt:\n{phase2_prompt or '(default)'}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -966,32 +853,41 @@ def build_3phase_subgraph(
         )
 
         try:
-            result = code_agent.execute_plan(plan, flat_data, phase2_prompt)
+            result = code_agent.execute_plan(plan_payload, flat_data, phase2_prompt)
         except Exception as e:
             _log(
-                f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+                f"{agent_type.value}|{sub_state['ticker']}|multi",
                 f"phase2_compute: code agent exception: {e}",
                 verbose=verbose,
             )
             result = {
                 "code_succeeded": False,
-                "mu": 0.0,
-                "sigma": 0.01,
+                "horizons": {},
                 "computed_metrics": [],
                 "computation_traces": [],
+                "metrics_selected": [],
             }
 
         succeeded = result.get("code_succeeded", False)
+        horizon_summary = ""
+        if "horizons" in result and result["horizons"]:
+            parts = []
+            for h, hv in result["horizons"].items():
+                parts.append(f"{h}: mu={hv.get('mu', 0.0):.4f} sigma={hv.get('sigma', 0.0):.4f}")
+            horizon_summary = "  " + "; ".join(parts)
+        else:
+            horizon_summary = f"mu={result.get('mu', 0.0):.4f} sigma={result.get('sigma', 0.0):.4f}"
+
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase2_compute: code agent finished  succeeded={succeeded}  mu={result.get('mu', 0.0):.4f}  sigma={result.get('sigma', 0.0):.4f}  metrics_computed={len(result.get('computed_metrics', []))}  traces={len(result.get('computation_traces', []))}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
+            f"phase2_compute: code agent finished  succeeded={succeeded}  {horizon_summary}  metrics_computed={len(result.get('computed_metrics', []))}  traces={len(result.get('computation_traces', []))}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase2_compute OUTPUT:\n{json.dumps(result, indent=2, default=str)}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1001,28 +897,76 @@ def build_3phase_subgraph(
 
         all_metrics: List[ComputedMetric] = list(sub_state["all_computed_metrics"])
         all_traces: List[ComputationTrace] = list(sub_state["all_computation_traces"])
+        all_selected: List[MetricPlanEntry] = list(sub_state["all_metrics_selected"])
 
-        typed_result = CodeAgentResult(
-            code_succeeded=bool(result.get("code_succeeded", False)),
-            mu=float(result.get("mu", 0.0)),
-            sigma=float(result.get("sigma", 0.01)),
-            mu_trace_id=str(result.get("mu_trace_id", "")),
-            sigma_trace_id=str(result.get("sigma_trace_id", "")),
-            computed_metrics=result.get("computed_metrics", []),
-            computation_traces=result.get("computation_traces", []),
-        )
+        # Support both multi-horizon output (new) and single-horizon fallback
+        raw_horizons = result.get("horizons", {})
+        if raw_horizons and isinstance(raw_horizons, dict):
+            typed_result = CodeAgentResult(
+                code_succeeded=bool(result.get("code_succeeded", False)),
+                mu=0.0,
+                sigma=0.01,
+                mu_trace_id="",
+                sigma_trace_id="",
+                computed_metrics=result.get("computed_metrics", []),
+                computation_traces=result.get("computation_traces", []),
+            )
+            # Attach horizons dict for downstream nodes
+            typed_result["horizons"] = raw_horizons
+        else:
+            typed_result = CodeAgentResult(
+                code_succeeded=bool(result.get("code_succeeded", False)),
+                mu=float(result.get("mu", 0.0)),
+                sigma=float(result.get("sigma", 0.01)),
+                mu_trace_id=str(result.get("mu_trace_id", "")),
+                sigma_trace_id=str(result.get("sigma_trace_id", "")),
+                computed_metrics=result.get("computed_metrics", []),
+                computation_traces=result.get("computation_traces", []),
+            )
+
+        # ── Safety net: ensure mu and sigma are present in computed_metrics ──
+        # The code agent sometimes omits them; we backfill from horizons/top-level.
+        _existing_metric_names = {
+            m.get("metric_name", "") for m in typed_result["computed_metrics"] if isinstance(m, dict)
+        }
+        if raw_horizons and isinstance(raw_horizons, dict):
+            for h, hv in raw_horizons.items():
+                if not isinstance(hv, dict):
+                    continue
+                for metric_name, trace_key in [("mu", "mu_trace_id"), ("sigma", "sigma_trace_id")]:
+                    if metric_name not in _existing_metric_names:
+                        typed_result["computed_metrics"].append({
+                            "metric_name": metric_name,
+                            "value": hv.get(metric_name),
+                            "computation_trace_id": hv.get(trace_key, ""),
+                            "term": h,
+                        })
+        else:
+            for metric_name, trace_key in [("mu", "mu_trace_id"), ("sigma", "sigma_trace_id")]:
+                if metric_name not in _existing_metric_names:
+                    typed_result["computed_metrics"].append({
+                        "metric_name": metric_name,
+                        "value": typed_result.get(metric_name),
+                        "computation_trace_id": typed_result.get(trace_key, ""),
+                    })
 
         if succeeded:
-            # Post-computation sanity check: sigma at floor (0.01) almost
-            # certainly means the code agent failed to compute volatility.
-            # Any real stock has annualised sigma >> 0.01.  Trigger a revision.
-            sigma_val = typed_result.get("sigma", 0.0)
-            mu_val = typed_result.get("mu", 0.0)
-            if sigma_val <= 0.0101:
+            # Post-computation sanity check: sigma at floor (0.01) for any
+            # horizon almost certainly means the code agent failed.
+            sigmas_to_check: list[float] = []
+            if raw_horizons and isinstance(raw_horizons, dict):
+                for hv in raw_horizons.values():
+                    if isinstance(hv, dict):
+                        sigmas_to_check.append(float(hv.get("sigma", 0.01)))
+            else:
+                sigmas_to_check.append(float(result.get("sigma", 0.01)))
+
+            any_at_floor = any(s <= 0.0101 for s in sigmas_to_check)
+            if any_at_floor:
                 _log(
-                    f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-                    f"phase2_compute: SIGMA AT FLOOR — sigma={sigma_val:.4f} "
-                    f"mu={mu_val:.4f}.  Real stocks have sigma >> 0.01; "
+                    f"{agent_type.value}|{sub_state['ticker']}|multi",
+                    f"phase2_compute: SIGMA AT FLOOR in at least one horizon — "
+                    f"sigmas={sigmas_to_check}.  Real stocks have sigma >> 0.01; "
                     f"treating as code failure and triggering revision.",
                     verbose=verbose,
                     trade_date=sub_state.get("trade_date", "")
@@ -1035,26 +979,70 @@ def build_3phase_subgraph(
                     "plan_revision_count": sub_state["plan_revision_count"] + 1,
                 }
 
-            # Build metric_interpretation lookup from Phase 1 plan
+            # Build metric_interpretation lookup from the code agent's plan output
+            selected_metrics = result.get("metrics_selected", [])
             interpretation_lookup: Dict[str, str] = {
-                m["metric_name"]: m["metric_interpretation"]
-                for m in plan["computation_plan"]
+                m.get("metric_name", ""): m.get("metric_interpretation", "")
+                for m in selected_metrics
+                if isinstance(m, dict)
             }
-            # Build typed ComputedMetric instances
-            for m in typed_result["computed_metrics"]:
-                trace_id = m.get("computation_trace_id") or str(uuid.uuid4())
-                all_metrics.append(
-                    ComputedMetric(
-                        metric_name=m["metric_name"],
-                        term=sub_state["horizon"],
-                        value=m["value"],
-                        metric_interpretation=interpretation_lookup.get(
-                            m["metric_name"], m.get("metric_interpretation", "")
-                        ),
-                        value_interpretation="",  # filled in Phase 3
-                        computation_trace_id=trace_id,
+            # Accumulate metrics_selected from code agent output
+            for m in selected_metrics:
+                if isinstance(m, dict):
+                    try:
+                        all_selected.append(
+                            MetricPlanEntry(
+                                metric_name=m.get("metric_name", ""),
+                                term=m.get("term", "long_term"),
+                                metric_interpretation=m.get("metric_interpretation", ""),
+                                metric_rationale=m.get("metric_rationale", ""),
+                                computation_instruction=m.get("computation_instruction", ""),
+                            )
+                        )
+                    except Exception:
+                        pass
+
+            # Build typed ComputedMetric instances.
+            # If the code agent output includes per-horizon computed_metrics,
+            # we use those; otherwise we tag everything with the (legacy) horizon.
+            per_horizon_metrics: Dict[str, list[dict]] = {}
+            if raw_horizons and isinstance(raw_horizons, dict):
+                for h, hv in raw_horizons.items():
+                    if isinstance(hv, dict):
+                        per_horizon_metrics[h] = hv.get("computed_metrics", [])
+
+            if per_horizon_metrics:
+                for h, metrics in per_horizon_metrics.items():
+                    for m in metrics:
+                        trace_id = m.get("computation_trace_id") or str(uuid.uuid4())
+                        all_metrics.append(
+                            ComputedMetric(
+                                metric_name=m["metric_name"],
+                                term=h,
+                                value=m["value"],
+                                metric_interpretation=interpretation_lookup.get(
+                                    m["metric_name"], m.get("metric_interpretation", "")
+                                ),
+                                value_interpretation="",
+                                computation_trace_id=trace_id,
+                            )
+                        )
+            else:
+                for m in typed_result["computed_metrics"]:
+                    trace_id = m.get("computation_trace_id") or str(uuid.uuid4())
+                    all_metrics.append(
+                        ComputedMetric(
+                            metric_name=m["metric_name"],
+                            term="long_term",
+                            value=m["value"],
+                            metric_interpretation=interpretation_lookup.get(
+                                m["metric_name"], m.get("metric_interpretation", "")
+                            ),
+                            value_interpretation="",
+                            computation_trace_id=trace_id,
+                        )
                     )
-                )
+
             for t in typed_result["computation_traces"]:
                 all_traces.append(
                     ComputationTrace(
@@ -1069,6 +1057,8 @@ def build_3phase_subgraph(
                 "code_succeeded": True,
                 "all_computed_metrics": all_metrics,
                 "all_computation_traces": all_traces,
+                "all_metrics_selected": all_selected,
+                "research_pass_count": pass_count,
             }
         else:
             return {
@@ -1080,7 +1070,7 @@ def build_3phase_subgraph(
     # ── Node: phase3_thesis ──────────────────────────────────────────────
 
     def phase3_thesis(sub_state: AnalystSubState) -> dict:
-        horizon = sub_state["horizon"]
+        active_horizons = sub_state["active_horizons"]
         gathered = sub_state["gathered_data"]
         all_metrics = sub_state["all_computed_metrics"]
         pass_count = sub_state["research_pass_count"]
@@ -1088,8 +1078,12 @@ def build_3phase_subgraph(
         max_passes = MAX_PASSES.get(depth, 2)
         code_succeeded = sub_state["code_succeeded"]
 
+        horizon_focus_text = "\n\n".join(
+            f"### {h}\n{horizon_focus.get(h, '')}" for h in active_horizons
+        )
+
         system_content = (
-            f"{phase3_prompt}\n\n{horizon_focus[horizon]}\n\n"
+            f"{phase3_prompt}\n\n{horizon_focus_text}\n\n"
             "You are given a list of computed metrics, each with a computation_trace_id that links "
             "to the exact code that produced it. Your job is to interpret the numbers and form a "
             "fully grounded view — no claims without a metric.\n\n"
@@ -1100,41 +1094,39 @@ def build_3phase_subgraph(
             "This ensures critical fields are never truncated.\n\n"
             "Required output structure (follow this key order):\n"
             "{\n"
-            '  "conviction": 0.0,  // Placeholder — conviction is computed deterministically from mu/sigma.\n'
-            '  "key_catalysts": [\n'
-            "    // Positive signals from computed metrics only\n"
-            '    { "catalyst": "<description>", "metric_name": "<name>", "computation_trace_id": "<id>" }\n'
-            "  ],\n"
-            '  "key_risks": [\n'
-            "    // Risks or warnings from computed metrics only\n"
-            '    { "risk": "<description>", "metric_name": "<name>", "computation_trace_id": "<id>" }\n'
-            "  ],\n"
+            '  "horizons": {\n'
+            '    "long_term": {\n'
+            '      "conviction": 0.0,  // Placeholder — computed deterministically.\n'
+            '      "key_catalysts": [\n'
+            '        { "catalyst": "<description>", "metric_name": "<name>", "computation_trace_id": "<id>" }\n'
+            "      ],\n"
+            '      "key_risks": [\n'
+            '        { "risk": "<description>", "metric_name": "<name>", "computation_trace_id": "<id>" }\n'
+            "      ],\n"
+            '      "investment_thesis": "<string built ONLY from the computed metrics. Cite each supporting metric inline as [metric_name | trace:<computation_trace_id>]. Keep CONCISE — under 300 words.>",\n'
+            '      "value_interpretations": [\n'
+            "        // One entry per computed metric for THIS horizon\n"
+            '        { "metric_name": "<name>", "computation_trace_id": "<id>", "interpretation": "<1-2 sentences>" }\n'
+            "      ]\n"
+            "    },\n"
+            '    "medium_term": { ... },\n'
+            '    "short_term": { ... }\n'
+            "  },\n"
             '  "needs_more_research": <bool — true ONLY if critical metrics are missing or code failed>,\n'
-            '  "additional_metrics_needed": "<string — what to compute next (only relevant if looping)>",\n'
-            '  "investment_thesis": "<string built ONLY from the computed metrics. '
-            "Cite each supporting metric inline as [metric_name | trace:<computation_trace_id>]. "
-            "Do not introduce any claim not backed by a metric in the input.  "
-            'Keep CONCISE — under 500 words.>",\n'
-            '  "value_interpretations": [\n'
-            "    // One entry per computed metric — every metric in the input MUST have an entry.\n"
-            "    // Keep each interpretation to 1-2 sentences.\n"
-            "    {\n"
-            '      "metric_name": "<exact metric_name from input>",\n'
-            '      "computation_trace_id": "<exact computation_trace_id from input>",\n'
-            '      "interpretation": "<what this specific computed VALUE means — 1-2 sentences max>"\n'
-            "    }\n"
-            "  ]\n"
+            '  "additional_metrics_needed": "<string — what to compute next (only relevant if looping)>"\n'
             "}\n\n"
             "CRITICAL: Your entire response must be the JSON object above and nothing else.\n"
-            "CRITICAL: Output conviction, key_catalysts, key_risks, needs_more_research, and\n"
-            "additional_metrics_needed BEFORE investment_thesis and value_interpretations.\n"
-            "These fields are required and must not be truncated."
+            "CRITICAL: Output horizons (with conviction, key_catalysts, key_risks) and\n"
+            "needs_more_research BEFORE investment_thesis and value_interpretations.\n"
+            "These fields are required and must not be truncated.\n\n"
+            "NOTE: Only include the horizons that are present in the input. If a horizon "
+            "has no computed metrics, you may omit it or provide empty arrays."
         )
 
         user_parts = [
             f"Ticker: {sub_state['ticker']}",
             f"Trade Date: {sub_state['trade_date']}",
-            f"Horizon: {horizon}",
+            f"Active Horizons: {', '.join(active_horizons)}",
             f"Research Pass: {pass_count} / Max {max_passes}",
             f"Code Succeeded: {code_succeeded}",
         ]
@@ -1142,17 +1134,34 @@ def build_3phase_subgraph(
         # Show headers + first 3 data rows per key for context window management
         preview_parts = []
         for key, entry in gathered.items():
-            h = entry["headers"]
-            lines = entry["data"].splitlines()
-            data_rows = lines[1:4] if len(lines) > 1 else []
-            snippet = "\n".join([h] + data_rows) if h else "\n".join(data_rows)
+            raw = entry["data"]
+            if isinstance(raw, str):
+                h = entry["headers"]
+                lines = raw.splitlines()
+                data_rows = lines[1:2] if len(lines) > 1 else []
+                snippet = "\n".join([h] + data_rows) if h else "\n".join(data_rows)
+            else:
+                # Dict / list / other non-string payloads — pretty-print JSON
+                text = (
+                    json.dumps(raw, indent=2, default=str)
+                    if isinstance(raw, (dict, list))
+                    else str(raw)
+                )
+                lines = text.splitlines()
+                snippet = "\n".join(lines[:2])
             preview_parts.append(f"[{key}]\n{snippet}")
         user_parts.append("\n=== Gathered Data ===\n" + "\n\n".join(preview_parts))
 
-        metrics_preview = json.dumps([m.model_dump() for m in all_metrics], indent=2)
-        user_parts.append(
-            f"\n=== ALL Computed Metrics (accumulated) ===\n{metrics_preview}"
-        )
+        # Group computed metrics by horizon for the prompt
+        metrics_by_horizon = {h: [] for h in active_horizons}
+        for m in all_metrics:
+            h = m.term
+            if h in metrics_by_horizon:
+                metrics_by_horizon[h].append(m.model_dump())
+        for h in active_horizons:
+            user_parts.append(
+                f"\n=== Computed Metrics for {h} ===\n{json.dumps(metrics_by_horizon[h], indent=2)}"
+            )
 
         # Provide fundamentals context to Phase 3 so the thesis can reference
         # the fundamental profile and calibration rules that shaped the metrics.
@@ -1168,7 +1177,7 @@ def build_3phase_subgraph(
         user_msg = HumanMessage(content="\n".join(user_parts))
 
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase3_thesis: invoking LLM  pass={pass_count}/{max_passes}  system_chars={len(system_content)}  user_chars={len(user_msg.content)}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1176,7 +1185,7 @@ def build_3phase_subgraph(
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase3_thesis LLM INPUT — system:\n{system_content}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1184,7 +1193,7 @@ def build_3phase_subgraph(
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase3_thesis LLM INPUT — user:\n{user_msg.content}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1200,7 +1209,7 @@ def build_3phase_subgraph(
         # 3. Should check if all key_catalysts key_risk match the given metric and trace.
 
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase3_thesis: LLM responded  output_chars={len(result.content)}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1208,7 +1217,7 @@ def build_3phase_subgraph(
             else "",
         )
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
             f"phase3_thesis LLM OUTPUT (raw):\n{result.content}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
@@ -1216,278 +1225,268 @@ def build_3phase_subgraph(
             else "",
         )
 
-        thesis = _parse_thesis_json(result.content)
-
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase3_thesis: parsed thesis JSON:\n{json.dumps(thesis, indent=2)}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-
-        # Determine whether to loop back for more research
-        wants_more = thesis.get("needs_more_research", False)
-        can_loop = pass_count < max_passes
-        will_loop = wants_more and can_loop
-
-        _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase3_thesis: pass={pass_count} conviction={thesis.get('conviction', 0):.2f} wants_more={wants_more} can_loop={can_loop} will_loop={will_loop}",
-            verbose=verbose,
-            trade_date=sub_state.get("trade_date", "")
-            if isinstance(sub_state, dict)
-            else "",
-        )
-
-        typed_thesis = ThesisResult(
-            investment_thesis=str(thesis.get("investment_thesis", "")),
-            conviction=float(thesis.get("conviction", 0.0)),
-            key_catalysts=_coerce_catalysts(thesis.get("key_catalysts")),
-            key_risks=_coerce_risks(thesis.get("key_risks")),
-            value_interpretations=_coerce_value_interpretations(
-                thesis.get("value_interpretations")
-            ),
-            needs_more_research=bool(thesis.get("needs_more_research", False)),
-            additional_metrics_needed=str(thesis.get("additional_metrics_needed", "")),
-        )
-
-        return {
-            "thesis": typed_thesis,
-            "needs_more_research": will_loop,
-            "plan_revision_count": 0,
-            "code_succeeded": True,
-        }
-
-    # ── Node: phase4_output ──────────────────────────────────────────────
-
-    def phase4_output(sub_state: AnalystSubState) -> dict:
-        thesis = sub_state["thesis"]
-        compute_result = sub_state["compute_result"]
-        sourced_data = sub_state["gathered_data"]
-
-        source_uuids: List[str] = [entry["uuid"] for entry in sourced_data.values()]
-
-        mu = _safe_float(compute_result["mu"])
-        sigma = max(_safe_float(compute_result["sigma"], 0.01), 1e-6)
-
-        if sigma <= 0.0101:
+        # Try multi-horizon parse first, fall back to single-horizon
+        raw_thesis = _parse_multi_horizon_thesis_json(result.content)
+        if raw_thesis and "horizons" in raw_thesis:
             _log(
-                f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-                f"phase4_output: WARNING sigma={sigma:.4f} at floor — "
-                f"code agent likely failed to compute volatility",
-                verbose=verbose,
-                trade_date=sub_state.get("trade_date", "")
-                if isinstance(sub_state, dict)
-                else "",
-            )
-
-        # Patch value_interpretation from Phase 3 onto each ComputedMetric
-        value_interpretation_by_trace: Dict[str, str] = {
-            v["computation_trace_id"]: v["interpretation"]
-            for v in thesis["value_interpretations"]
-        }
-        computed_metrics: List[ComputedMetric] = [
-            ComputedMetric(
-                metric_name=m.metric_name,
-                term=sub_state["horizon"],
-                value=m.value,
-                metric_interpretation=m.metric_interpretation,
-                value_interpretation=value_interpretation_by_trace.get(
-                    m.computation_trace_id, ""
-                ),
-                computation_trace_id=m.computation_trace_id,
-            )
-            for m in sub_state["all_computed_metrics"]
-        ]
-
-        # ── Deterministic conviction computation ───────────────────────
-        # Conviction measures confidence in the mu/sigma calculation itself,
-        # NOT the signal strength (direction is in mu, magnitude in sigma).
-        #
-        # Uses a logit-sigmoid formulation so that ANY weak component can
-        # push conviction toward 0.5 (neutral), and strong agreement across
-        # all components pushes it toward 1.0. This gives much wider dynamic
-        # range than a weighted sum.
-        #
-        # Components (all mapped to [0, 1]):
-        #   c  = signal_concordance   [0, 1]   directional agreement
-        #   d  = dispersion_score     [0, 1]   1 - stdev(signals)/0.05
-        #   r  = regime_clarity       [0.5, 1] clear vs ambiguous regime
-        #   s  = signal_significance  [0, 1]   min(|mu| / 0.02, 1.0)
-        #   dc = data_completeness    [0, 1]   n_computed / n_planned
-        #
-        # Logit = 3.0*(c-0.5) + 1.5*(d-0.5) + 0.8*(r-0.5) + 0.8*(s-0.5) + 0.4*(dc-0.5)
-        # conviction = 1 / (1 + exp(-2*logit))
-        #
-        # Fallback: if signal_concordance is not in computed_metrics (e.g.
-        # non-technical analysts), fall back to a |mu|/sigma signal-to-noise
-        # heuristic so conviction is not zero.
-        #
-        # Conviction is always in [0, 1] — it measures confidence in
-        # the calculation, not direction (direction is already in mu).
-        # If sigma is at floor (0.01) or fewer than 2 metrics computed,
-        # conviction defaults to 0.0 (insufficient data).
-        import math
-
-        n_computed = len(computed_metrics)
-        n_planned = len(sub_state["computation_plan"].get("computation_plan", []))
-        data_completeness = min(n_computed / max(n_planned, 1), 1.0)
-
-        # Extract signal_concordance from computed_metrics
-        signal_concordance: Optional[float] = None
-        for m in computed_metrics:
-            if m.metric_name == "signal_concordance" and m.value is not None:
-                try:
-                    signal_concordance = float(m.value)
-                    signal_concordance = max(0.0, min(1.0, signal_concordance))
-                except (TypeError, ValueError):
-                    signal_concordance = None
-                break
-
-        # Extract signal_dispersion from computed_metrics
-        signal_dispersion: Optional[float] = None
-        for m in computed_metrics:
-            if m.metric_name == "signal_dispersion" and m.value is not None:
-                try:
-                    signal_dispersion = float(m.value)
-                    signal_dispersion = max(0.0, signal_dispersion)
-                except (TypeError, ValueError):
-                    signal_dispersion = None
-                break
-
-        if sigma <= 0.0101 or n_computed < 2:
-            deterministic_conviction = 0.0
-            _log(
-                f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-                f"phase4_output: conviction=0.0 (insufficient data: "
-                f"sigma={sigma:.4f} n_computed={n_computed})",
-                verbose=verbose,
-                trade_date=sub_state.get("trade_date", "")
-                if isinstance(sub_state, dict)
-                else "",
-            )
-        elif signal_concordance is not None:
-            # 1. dispersion_score: high dispersion → low score
-            if signal_dispersion is not None:
-                dispersion_score = max(0.0, 1.0 - signal_dispersion / 0.05)
-            else:
-                dispersion_score = 0.5  # default if missing
-
-            # 2. regime_clarity: clear regime = 1.0, ambiguous = 0.5
-            regime_clarity = 0.5  # default if ER not available
-            for m in computed_metrics:
-                if m.metric_name == "kaufman_efficiency_ratio" and m.value is not None:
-                    try:
-                        er = abs(float(m.value))
-                        if er < 0.20 or er > 0.40:
-                            regime_clarity = 1.0
-                        else:
-                            regime_clarity = 0.5
-                    except (TypeError, ValueError):
-                        pass
-                    break
-
-            # 3. signal_significance: how far from neutral (lowered threshold)
-            signal_significance = min(abs(mu) / 0.02, 1.0)
-
-            # Logit-sigmoid conviction (non-linear, wider dynamic range)
-            logit = (
-                3.0 * (signal_concordance - 0.5)
-                + 1.5 * (dispersion_score - 0.5)
-                + 0.8 * (regime_clarity - 0.5)
-                + 0.8 * (signal_significance - 0.5)
-                + 0.4 * (data_completeness - 0.5)
-            )
-            raw_conviction = 1.0 / (1.0 + math.exp(-2.0 * logit))
-            deterministic_conviction = round(max(0.0, min(raw_conviction, 1.0)), 2)
-
-            _log(
-                f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-                f"phase4_output: deterministic conviction: "
-                f"mu={mu:.4f} sigma={sigma:.4f} "
-                f"signal_concordance={signal_concordance:.2f} "
-                f"dispersion={signal_dispersion if signal_dispersion is not None else 'N/A'} "
-                f"dispersion_score={dispersion_score:.2f} "
-                f"regime_clarity={regime_clarity:.2f} "
-                f"signal_significance={signal_significance:.2f} "
-                f"data_completeness={data_completeness:.2f} "
-                f"logit={logit:.2f} "
-                f"conviction={deterministic_conviction:.2f} "
-                f"(LLM was {thesis['conviction']:.2f})",
+                f"{agent_type.value}|{sub_state['ticker']}|multi",
+                f"phase3_thesis: parsed MULTI-HORIZON thesis JSON:\n{json.dumps(raw_thesis, indent=2)}",
                 verbose=verbose,
                 trade_date=sub_state.get("trade_date", "")
                 if isinstance(sub_state, dict)
                 else "",
             )
         else:
-            # Fallback for analysts that don't compute signal_concordance:
-            # use |mu|/sigma as a signal-to-noise heuristic
-            snr_fallback = min(abs(mu) / max(sigma, 0.01), 1.0)
-            raw_conviction = data_completeness * snr_fallback
-            deterministic_conviction = round(min(raw_conviction, 1.0), 2)
+            # Fallback: parse as single-horizon thesis and replicate across all active horizons
+            single_thesis = _parse_thesis_json(result.content)
+            raw_thesis = {
+                "horizons": {},
+                "needs_more_research": single_thesis.get("needs_more_research", False),
+                "additional_metrics_needed": single_thesis.get("additional_metrics_needed", ""),
+            }
+            for h in active_horizons:
+                raw_thesis["horizons"][h] = single_thesis
             _log(
-                f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-                f"phase4_output: deterministic conviction (fallback, no concordance): "
-                f"mu={mu:.4f} sigma={sigma:.4f} "
-                f"data_completeness={data_completeness:.2f} "
-                f"snr_fallback={snr_fallback:.2f} "
-                f"conviction={deterministic_conviction:.2f} "
-                f"(LLM was {thesis['conviction']:.2f})",
+                f"{agent_type.value}|{sub_state['ticker']}|multi",
+                f"phase3_thesis: parsed SINGLE-HORIZON thesis JSON (replicated):\n{json.dumps(raw_thesis, indent=2)}",
                 verbose=verbose,
                 trade_date=sub_state.get("trade_date", "")
                 if isinstance(sub_state, dict)
                 else "",
             )
 
-        output = HorizonOutput(
-            mu=mu,
-            mu_trace_id=compute_result["mu_trace_id"],
-            sigma_contribution=sigma,
-            sigma_trace_id=compute_result["sigma_trace_id"],
-            computed_metrics=computed_metrics,
-            investment_thesis=thesis["investment_thesis"],
-            conviction=deterministic_conviction,
-            key_catalysts=thesis["key_catalysts"],
-            key_risks=thesis["key_risks"],
-            source_uuids=source_uuids,
-            computation_traces=list(sub_state["all_computation_traces"]),
-            contributing_factors=[],
-        )
+        # Determine whether to loop back for more research
+        wants_more = raw_thesis.get("needs_more_research", False)
+        can_loop = pass_count < max_passes
+        will_loop = wants_more and can_loop
+
+        # Build per-horizon ThesisResult objects
+        thesis_by_horizon = {}
+        for h in active_horizons:
+            h_data = raw_thesis.get("horizons", {}).get(h, {})
+            typed = ThesisResult(
+                investment_thesis=str(h_data.get("investment_thesis", "")),
+                conviction=float(h_data.get("conviction", 0.0)),
+                key_catalysts=_coerce_catalysts(h_data.get("key_catalysts")),
+                key_risks=_coerce_risks(h_data.get("key_risks")),
+                value_interpretations=_coerce_value_interpretations(
+                    h_data.get("value_interpretations")
+                ),
+                needs_more_research=bool(h_data.get("needs_more_research", False)),
+                additional_metrics_needed=str(h_data.get("additional_metrics_needed", "")),
+            )
+            thesis_by_horizon[h] = typed
+
+        # Use the first active horizon's thesis as the legacy "thesis" field
+        first_horizon = active_horizons[0] if active_horizons else "long_term"
+        first_thesis = thesis_by_horizon.get(first_horizon, ThesisResult(
+            investment_thesis="",
+            conviction=0.0,
+            key_catalysts=[],
+            key_risks=[],
+            value_interpretations=[],
+            needs_more_research=False,
+            additional_metrics_needed="",
+        ))
 
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase4_output: horizon={sub_state['horizon']} mu={output['mu']:.4f} sigma={output['sigma_contribution']:.4f} conviction={output['conviction']:.2f}  metrics={len(output['computed_metrics'])}  catalysts={len(output['key_catalysts'])}  risks={len(output['key_risks'])}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
+            f"phase3_thesis: pass={pass_count} wants_more={wants_more} can_loop={can_loop} will_loop={will_loop}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
+
+        return {
+            "thesis": first_thesis,
+            "thesis_by_horizon": thesis_by_horizon,
+            "needs_more_research": will_loop,
+            "plan_revision_count": 0,
+            "code_succeeded": True,
+            "additional_instructions": str(raw_thesis.get("additional_metrics_needed", "")),
+        }
+
+    # ── Node: phase4_output ──────────────────────────────────────────────
+
+    def phase4_output(sub_state: AnalystSubState) -> dict:
+        thesis_by_horizon = sub_state.get("thesis_by_horizon", {})
+        compute_result = sub_state["compute_result"]
+        sourced_data = sub_state["gathered_data"]
+        active_horizons = sub_state["active_horizons"]
+
+        source_uuids: List[str] = [entry["uuid"] for entry in sourced_data.values()]
+
+        # Support both multi-horizon and single-horizon compute_result formats
+        raw_horizons = compute_result.get("horizons", {})
+
+        final_outputs: Dict[str, HorizonOutput] = {}
+
+        for horizon in active_horizons:
+            h_thesis = thesis_by_horizon.get(horizon, ThesisResult(
+                investment_thesis="",
+                conviction=0.0,
+                key_catalysts=[],
+                key_risks=[],
+                value_interpretations=[],
+                needs_more_research=False,
+                additional_metrics_needed="",
+            ))
+
+            if raw_horizons and isinstance(raw_horizons, dict) and horizon in raw_horizons:
+                h_result = raw_horizons[horizon]
+                mu = _safe_float(h_result.get("mu", 0.0))
+                sigma = max(_safe_float(h_result.get("sigma", 0.01), 0.01), 1e-6)
+                mu_trace_id = str(h_result.get("mu_trace_id", ""))
+                sigma_trace_id = str(h_result.get("sigma_trace_id", ""))
+            else:
+                mu = _safe_float(compute_result.get("mu", 0.0))
+                sigma = max(_safe_float(compute_result.get("sigma", 0.01), 0.01), 1e-6)
+                mu_trace_id = str(compute_result.get("mu_trace_id", ""))
+                sigma_trace_id = str(compute_result.get("sigma_trace_id", ""))
+
+            if sigma <= 0.0101:
+                _log(
+                    f"{agent_type.value}|{sub_state['ticker']}|multi",
+                    f"phase4_output: WARNING sigma={sigma:.4f} at floor for {horizon} — "
+                    f"code agent likely failed to compute volatility",
+                    verbose=verbose,
+                    trade_date=sub_state.get("trade_date", "")
+                    if isinstance(sub_state, dict)
+                    else "",
+                )
+
+            # Patch value_interpretation from Phase 3 onto each ComputedMetric for this horizon
+            value_interpretation_by_trace: Dict[str, str] = {
+                v["computation_trace_id"]: v["interpretation"]
+                for v in h_thesis["value_interpretations"]
+            }
+            horizon_metrics: List[ComputedMetric] = [
+                ComputedMetric(
+                    metric_name=m.metric_name,
+                    term=horizon,
+                    value=m.value,
+                    metric_interpretation=m.metric_interpretation,
+                    value_interpretation=value_interpretation_by_trace.get(
+                        m.computation_trace_id, ""
+                    ),
+                    computation_trace_id=m.computation_trace_id,
+                )
+                for m in sub_state["all_computed_metrics"]
+                if m.term == horizon
+            ]
+
+            # ── Deterministic conviction computation (per-horizon) ───────────────────────
+            import math
+
+            n_computed = len(horizon_metrics)
+            data_completeness = min(n_computed / max(len(horizon_metrics) if horizon_metrics else 1, 1), 1.0)
+
+            signal_concordance: Optional[float] = None
+            for m in horizon_metrics:
+                if m.metric_name == "signal_concordance" and m.value is not None:
+                    try:
+                        signal_concordance = float(m.value)
+                        signal_concordance = max(0.0, min(1.0, signal_concordance))
+                    except (TypeError, ValueError):
+                        signal_concordance = None
+                    break
+
+            signal_dispersion: Optional[float] = None
+            for m in horizon_metrics:
+                if m.metric_name == "signal_dispersion" and m.value is not None:
+                    try:
+                        signal_dispersion = float(m.value)
+                        signal_dispersion = max(0.0, signal_dispersion)
+                    except (TypeError, ValueError):
+                        signal_dispersion = None
+                    break
+
+            if sigma <= 0.0101 or n_computed < 2:
+                deterministic_conviction = 0.0
+            elif signal_concordance is not None:
+                if signal_dispersion is not None:
+                    dispersion_score = max(0.0, 1.0 - signal_dispersion / 0.05)
+                else:
+                    dispersion_score = 0.5
+
+                regime_clarity = 0.5
+                for m in horizon_metrics:
+                    if m.metric_name == "kaufman_efficiency_ratio" and m.value is not None:
+                        try:
+                            er = abs(float(m.value))
+                            if er < 0.20 or er > 0.40:
+                                regime_clarity = 1.0
+                            else:
+                                regime_clarity = 0.5
+                        except (TypeError, ValueError):
+                            pass
+                        break
+
+                signal_significance = min(abs(mu) / 0.02, 1.0)
+                logit = (
+                    3.0 * (signal_concordance - 0.5)
+                    + 1.5 * (dispersion_score - 0.5)
+                    + 0.8 * (regime_clarity - 0.5)
+                    + 0.8 * (signal_significance - 0.5)
+                    + 0.4 * (data_completeness - 0.5)
+                )
+                raw_conviction = 1.0 / (1.0 + math.exp(-2.0 * logit))
+                deterministic_conviction = round(max(0.0, min(raw_conviction, 1.0)), 2)
+            else:
+                snr_fallback = min(abs(mu) / max(sigma, 0.01), 1.0)
+                raw_conviction = data_completeness * snr_fallback
+                deterministic_conviction = round(min(raw_conviction, 1.0), 2)
+
+            output = HorizonOutput(
+                mu=mu,
+                mu_trace_id=mu_trace_id,
+                sigma_contribution=sigma,
+                sigma_trace_id=sigma_trace_id,
+                computed_metrics=horizon_metrics,
+                investment_thesis=h_thesis["investment_thesis"],
+                conviction=deterministic_conviction,
+                key_catalysts=h_thesis["key_catalysts"],
+                key_risks=h_thesis["key_risks"],
+                source_uuids=source_uuids,
+                computation_traces=list(sub_state["all_computation_traces"]),
+                contributing_factors=[],
+            )
+
+            final_outputs[horizon] = output
+
+            _log(
+                f"{agent_type.value}|{sub_state['ticker']}|multi",
+                f"phase4_output: {horizon} mu={output['mu']:.4f} sigma={output['sigma_contribution']:.4f} conviction={output['conviction']:.2f}  metrics={len(output['computed_metrics'])}  catalysts={len(output['key_catalysts'])}  risks={len(output['key_risks'])}",
+                verbose=verbose,
+                trade_date=sub_state.get("trade_date", "")
+                if isinstance(sub_state, dict)
+                else "",
+            )
+
         _log(
-            f"{agent_type.value}|{sub_state['ticker']}|{sub_state['horizon']}",
-            f"phase4_output: full output:\n{json.dumps(output, indent=2, default=str)}",
+            f"{agent_type.value}|{sub_state['ticker']}|multi",
+            f"phase4_output: full outputs for {list(final_outputs.keys())}",
             verbose=verbose,
             trade_date=sub_state.get("trade_date", "")
             if isinstance(sub_state, dict)
             else "",
         )
 
-        return {"final_output": output}
-
+        return {"final_outputs": final_outputs}
     # ── Routing functions ────────────────────────────────────────────────
 
     def route_after_compute(sub_state: AnalystSubState) -> str:
         if sub_state["code_succeeded"]:
             return "phase3_thesis"
-        # Allow up to 2 plan revisions: count goes 1 -> 2 -> (give up at 3)
+        # Allow up to 2 code revisions: count goes 1 -> 2 -> (give up at 3)
         if sub_state["plan_revision_count"] <= 2:
-            return "phase1_plan"
+            return "phase2_compute"
         return "phase3_thesis"
 
     def route_after_thesis(sub_state: AnalystSubState) -> str:
         if sub_state["needs_more_research"]:
-            return "phase1_plan"
+            return "phase2_compute"
         return "phase4_output"
 
     # ── Build graph ──────────────────────────────────────────────────────
@@ -1495,24 +1494,22 @@ def build_3phase_subgraph(
     graph = StateGraph(AnalystSubState)
 
     graph.add_node("data_gathering", data_gathering)
-    graph.add_node("phase1_plan", phase1_plan)
     graph.add_node("phase2_compute", phase2_compute)
     graph.add_node("phase3_thesis", phase3_thesis)
     graph.add_node("phase4_output", phase4_output)
 
     graph.add_edge(START, "data_gathering")
-    graph.add_edge("data_gathering", "phase1_plan")
-    graph.add_edge("phase1_plan", "phase2_compute")
+    graph.add_edge("data_gathering", "phase2_compute")
 
     graph.add_conditional_edges(
         "phase2_compute",
         route_after_compute,
-        ["phase1_plan", "phase3_thesis"],
+        ["phase2_compute", "phase3_thesis"],
     )
     graph.add_conditional_edges(
         "phase3_thesis",
         route_after_thesis,
-        ["phase1_plan", "phase4_output"],
+        ["phase2_compute", "phase4_output"],
     )
 
     graph.add_edge("phase4_output", END)
@@ -1660,8 +1657,8 @@ def create_analyst_node(
     """Create an analyst node function for the outer AgentState graph.
 
     The returned function:
-      1. Runs the 3-phase subgraph once per horizon (long, medium, short)
-      2. Merges the three results into a single ResearchReport
+      1. Runs the 3-phase subgraph ONCE for all active horizons together
+      2. Merges the per-horizon outputs into a single ResearchReport
       3. Returns {state_key: report_json} for the outer graph state
 
     Parameters
@@ -1672,7 +1669,7 @@ def create_analyst_node(
         agent_type           : AgentType
         state_key            : str — key in AgentState to write the report to
         gather_fn            : callable(ticker, trade_date, lookback_days) -> dict
-        phase1_system_prompt : str
+        phase2_system_prompt : str
         phase3_system_prompt : str
     research_depth : "shallow" | "medium" | "deep"
     """
@@ -1688,89 +1685,66 @@ def create_analyst_node(
         ticker = state["company_of_interest"]
         trade_date = state["trade_date"]
 
+        active_horizons = list(
+            analyst_config.get(
+                "active_horizons", ("long_term", "medium_term", "short_term")
+            )
+        )
+
         _log(
             log_tag,
-            f"Starting analysis for {ticker} on {trade_date} (depth={research_depth})",
+            f"Starting analysis for {ticker} on {trade_date} (depth={research_depth}, horizons={active_horizons})",
             verbose=verbose,
             trade_date=trade_date,
         )
 
-        def _run_horizon(horizon: str) -> tuple[str, dict]:
-            sub_state: AnalystSubState = {
-                "ticker": ticker,
-                "trade_date": trade_date,
-                "horizon": horizon,
-                "research_depth": research_depth,
-                "gathered_data": {},
-                "computation_plan": ComputationPlanState(
-                    computation_plan=[],
-                    ticker="",
-                    analysis_date="",
-                    horizon="",
-                    analyst_type="",
-                ),
-                "all_computed_metrics": [],
-                "all_computation_traces": [],
-                "all_metrics_selected": [],
-                "compute_result": CodeAgentResult(
-                    code_succeeded=False,
-                    mu=0.0,
-                    sigma=0.01,
-                    mu_trace_id="",
-                    sigma_trace_id="",
-                    computed_metrics=[],
-                    computation_traces=[],
-                ),
-                "code_succeeded": False,
-                "plan_revision_count": 0,
-                "research_pass_count": 0,
-                "thesis": ThesisResult(
-                    investment_thesis="",
-                    conviction=0.0,
-                    key_catalysts=[],
-                    key_risks=[],
-                    value_interpretations=[],
-                    needs_more_research=False,
-                    additional_metrics_needed="",
-                ),
-                "needs_more_research": False,
-                "final_output": HorizonOutput(
-                    mu=0.0,
-                    mu_trace_id="",
-                    sigma_contribution=0.01,
-                    sigma_trace_id="",
-                    computed_metrics=[],
-                    investment_thesis="",
-                    conviction=0.0,
-                    key_catalysts=[],
-                    key_risks=[],
-                    source_uuids=[],
-                    computation_traces=[],
-                    contributing_factors=[],
-                ),
-            }
-            result = sub_graph.invoke(sub_state)
-            _log(
-                f"{log_tag}|{ticker}|{horizon}",
-                f"Completed horizon: {horizon}",
-                verbose=verbose,
-                trade_date=trade_date,
-            )
-            return horizon, result
+        sub_state: AnalystSubState = {
+            "ticker": ticker,
+            "trade_date": trade_date,
+            "active_horizons": active_horizons,
+            "research_depth": research_depth,
+            "gathered_data": {},
+            "all_computed_metrics": [],
+            "all_computation_traces": [],
+            "all_metrics_selected": [],
+            "compute_result": CodeAgentResult(
+                code_succeeded=False,
+                mu=0.0,
+                sigma=0.01,
+                mu_trace_id="",
+                sigma_trace_id="",
+                computed_metrics=[],
+                computation_traces=[],
+            ),
+            "code_succeeded": False,
+            "plan_revision_count": 0,
+            "research_pass_count": 0,
+            "thesis": ThesisResult(
+                investment_thesis="",
+                conviction=0.0,
+                key_catalysts=[],
+                key_risks=[],
+                value_interpretations=[],
+                needs_more_research=False,
+                additional_metrics_needed="",
+            ),
+            "thesis_by_horizon": {},
+            "needs_more_research": False,
+            "additional_instructions": "",
+            "final_outputs": {},
+        }
 
-        # Determine which horizons to actually run (default: all three)
-        active_horizons = analyst_config.get(
-            "active_horizons", ("long_term", "medium_term", "short_term")
+        result = sub_graph.invoke(sub_state)
+
+        _log(
+            f"{log_tag}|{ticker}|_",
+            f"Completed subgraph for horizons: {active_horizons}",
+            verbose=verbose,
+            trade_date=trade_date,
         )
 
-        horizon_results: Dict[str, HorizonOutput] = {}
-        all_metrics_selected: List[MetricPlanEntry] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_run_horizon, h): h for h in active_horizons}
-            for fut in concurrent.futures.as_completed(futures):
-                horizon, result = fut.result()
-                horizon_results[horizon] = result["final_output"]
-                all_metrics_selected.extend(result.get("all_metrics_selected", []))
+        horizon_results: Dict[str, HorizonOutput] = result.get("final_outputs", {})
+        all_metrics_selected: List[MetricPlanEntry] = result.get("all_metrics_selected", [])
 
         report = merge_horizon_results(
             horizon_results,

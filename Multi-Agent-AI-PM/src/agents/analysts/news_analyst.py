@@ -139,28 +139,20 @@ def create_news_analyst(
         return messages
 
     def _extract_structured_output(messages: list, system_content: str) -> dict | None:
-        """Extract a validated dict from the conversation history.
+        """Call the LLM with structured output to extract a validated dict.
 
-        First tries to parse JSON already present in the last AI message.
-        Falls back to structured-output re-invocation only when parsing fails.
+        Falls back to text parsing if structured output is unavailable or fails.
         """
-        # 1. Parse JSON from the most recent AI message in history
-        for msg in reversed(messages):
-            if getattr(msg, "type", None) == "ai":
-                text = msg.content if hasattr(msg, "content") else str(msg)
-                parsed = _parse_json_from_text(text)
-                if parsed:
-                    return parsed
-                break  # only check the latest AI turn
-
-        # 2. Fallback: ask the LLM to emit structured output
         try:
             structured_llm = llm.with_structured_output(_NewsAnalystLLMOutput)
             chain = prompt.partial(system_message=system_content) | structured_llm
             output: _NewsAnalystLLMOutput = chain.invoke({"messages": messages})
             return output.model_dump()
         except Exception:
-            return None
+            # Fallback: parse JSON from the last assistant message
+            last = messages[-1]
+            text = last.content if hasattr(last, "content") else str(last)
+            return _parse_json_from_text(text)
 
     _CANONICAL_WINDOWS = [
         # (label, lookback_start_days, lookback_end_days, recency_weight)
@@ -211,6 +203,7 @@ def create_news_analyst(
     def news_analyst_node(state: dict) -> dict:
         ticker = state["company_of_interest"]
         trade_date = state["trade_date"]
+        regime_context = state.get("regime_context", "")
 
         # ── Pre-fetch canonical windows (unified with recency weighting) ──────
         canonical_messages = _prefetch_canonical(ticker, trade_date)
@@ -219,6 +212,15 @@ def create_news_analyst(
         initial_system = SYSTEM_PROMPT.replace(
             "HORIZON_PLACEHOLDER", horizons_str
         ).replace("DEPTH_PLACEHOLDER", research_depth)
+
+        if regime_context:
+            initial_system = (
+                f"MARKET REGIME CONTEXT: {regime_context}\n\n"
+                "Use this regime context to calibrate your expectations. "
+                "In bear markets or crashes, actively look for NEGATIVE signals and downside risks. "
+                "Do NOT default to bullish assumptions.\n\n"
+                + initial_system
+            )
 
         messages = [
             HumanMessage(
@@ -302,7 +304,7 @@ def create_news_analyst(
                 current_thesis_json = critiqued
 
         # ── Build final ResearchReport ──────────────────────────────────────
-        report_json = _build_report(current_thesis_json, ticker, trade_date)
+        report_json = _build_report(current_thesis_json, ticker, trade_date, horizons)
         confidence_rationale = (
             current_thesis_json.get("confidence_rationale", {})
             if current_thesis_json
@@ -365,7 +367,14 @@ def _parse_json_from_text(text: str) -> dict | None:
 # ── Report assembly ────────────────────────────────────────────────────────────
 
 
-def _build_report(d: dict | None, ticker: str, trade_date: str) -> str:
+def _is_active_horizon(thesis: dict, key: str) -> bool:
+    """Return True if the horizon has a non-empty thesis."""
+    return bool(thesis.get(key, ""))
+
+
+def _build_report(
+    d: dict | None, ticker: str, trade_date: str, active_horizons: tuple[str, ...] = ()
+) -> str:
     """Build a validated ResearchReport JSON string from the LLM's output dict."""
     if not d:
         return _zero_report(ticker, trade_date)
@@ -385,6 +394,23 @@ def _build_report(d: dict | None, ticker: str, trade_date: str) -> str:
         def _hs(hv: dict, key: str) -> str:
             v = hv.get(key, "")
             return str(v) if v else ""
+
+        # Determine active horizons
+        active = {
+            "long_term": "long_term" in active_horizons or _is_active_horizon(thesis, "long_term"),
+            "medium_term": "medium_term" in active_horizons or _is_active_horizon(thesis, "medium_term"),
+            "short_term": "short_term" in active_horizons or _is_active_horizon(thesis, "short_term"),
+        }
+
+        def _coerce_sigma(val: float, key: str) -> float:
+            if active.get(key, False):
+                return max(val, 0.01)
+            return val
+
+        def _coerce_conviction(val: float, key: str) -> float:
+            if active.get(key, False):
+                return max(val, 0.05)
+            return val
 
         # Build citation chain from LLM output
         citation_chain: list[Citation] = []
@@ -410,9 +436,9 @@ def _build_report(d: dict | None, ticker: str, trade_date: str) -> str:
             ),
             mu_trace_id=None,
             sigma_contribution=HorizonValues(
-                long_term=_hf(sigma, "long_term"),
-                medium_term=_hf(sigma, "medium_term"),
-                short_term=_hf(sigma, "short_term"),
+                long_term=_coerce_sigma(_hf(sigma, "long_term"), "long_term"),
+                medium_term=_coerce_sigma(_hf(sigma, "medium_term"), "medium_term"),
+                short_term=_coerce_sigma(_hf(sigma, "short_term"), "short_term"),
             ),
             sigma_trace_id=None,
             computed_metrics=[],
@@ -422,9 +448,9 @@ def _build_report(d: dict | None, ticker: str, trade_date: str) -> str:
                 short_term=_hs(thesis, "short_term"),
             ),
             conviction=HorizonValues(
-                long_term=_hf(conviction, "long_term"),
-                medium_term=_hf(conviction, "medium_term"),
-                short_term=_hf(conviction, "short_term"),
+                long_term=_coerce_conviction(_hf(conviction, "long_term"), "long_term"),
+                medium_term=_coerce_conviction(_hf(conviction, "medium_term"), "medium_term"),
+                short_term=_coerce_conviction(_hf(conviction, "short_term"), "short_term"),
             ),
             key_catalysts=_coerce_catalysts(d.get("key_catalysts")),
             key_risks=_coerce_risks(d.get("key_risks")),

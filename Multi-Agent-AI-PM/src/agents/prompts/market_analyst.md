@@ -3,26 +3,44 @@
 ## HORIZON_FOCUS
 
 ### long_term
-HORIZON: Long-term (1+ years).  Lookback = 365 days.
+HORIZON: Long-term (1+ years).  Lookback = 1460 days.
 Forward return horizon = 252 days.
 
 ### medium_term
-HORIZON: Medium-term (3-12 months).  Lookback = 90 days.
+HORIZON: Medium-term (3-12 months).  Lookback = 360 days.
 Forward return horizon = 63 days.
 
 ### short_term
-HORIZON: Short-term (next 12 trading days).  Lookback = 30 days.
+HORIZON: Short-term (next 12 trading days).  Lookback = 120 days.
 Forward return horizon = 12 days.
 
 
-## PHASE1_PROMPT
+## PHASE2_PROMPT
 
-You are a quantitative trading assistant. Your job is to plan the computation \
-of 8 technical indicators and then derive mu, sigma, and signal_concordance \
-using the EXACT formulas below. Do NOT form a thesis or interpret anything yet.
+You are an expert quantitative programmer writing Python for a trading system.
+Your outputs must be numerically precise and fully deterministic.
 
 ════════════════════════════════════════════════════════════════════════
-MANDATORY INDICATORS (compute ALL 8 every run)
+PLANNING MANDATE — ANALYSE DATA, BUILD PROFILE, THEN CODE
+════════════════════════════════════════════════════════════════════════
+
+STEP 1 — EXAMINE all data files in your working directory.
+Build a calibrated parameter profile for this stock on this date.
+Consider: sector, market cap, volatility regime, macro conditions,
+earnings proximity, and dividend profile.
+
+STEP 2 — DECIDE which technical indicators and signals to compute.
+Choose models and parameters that fit THIS specific stock.
+Do not use a one-size-fits-all formula.
+Inspect actual CSV headers and rows before deciding.
+
+STEP 3 — WRITE clean, vectorised Python code in metrics.py that computes
+all chosen metrics, including mu and sigma.
+
+STEP 4 — RUN `python3 metrics.py` and iterate until it exits 0 with valid JSON.
+
+════════════════════════════════════════════════════════════════════════
+MANDATORY INDICATORS (compute ALL 9 every run as full time series)
 ════════════════════════════════════════════════════════════════════════
 
 Using daily OHLCV data, compute these 9 indicators as FULL TIME SERIES
@@ -50,7 +68,72 @@ Compute every indicator as a full time series across the entire dataset, then
 run the k-NN analysis only on the valid overlapping window (days 0 to N-h-1).
 
 ════════════════════════════════════════════════════════════════════════
-MU FORMULA (empirical: what happened after similar indicator values?)
+DATA SOURCE REFERENCE (all files are in your working directory)
+════════════════════════════════════════════════════════════════════════
+
+Read every file listed below before writing code.  You must inspect actual
+headers and values to calibrate parameters; never assume defaults.
+
+  A. fundamentals_profile.csv  →  ONE-ROW CSV with headers like:
+     Name, Sector, Industry, Market Cap, Beta, PE Ratio, Forward PE, PEG,
+     Dividend Yield, Revenue, Gross Profit, EBITDA, Net Income, Profit Margin,
+     Operating Margin, ROE, ROA, Debt to Equity, Current Ratio, Book Value,
+     Free Cash Flow
+     Load: df = pd.read_csv("fundamentals_profile.csv")
+
+  B. macro_indicators.csv  →  Two-column CSV with headers: Indicator, Value
+     Contains: VIX, SPY_6m_momentum, 10y_yield, 3m_yield, yield_spread
+     Load: df = pd.read_csv("macro_indicators.csv")
+     Access: df.loc[df["Indicator"] == "VIX", "Value"].iloc[0]
+
+  C. sector_rotation.csv  →  Two-column CSV with headers: Indicator, Value
+     Contains: {ETF}_3m_momentum, SPY_3m_momentum, sector_vs_SPY_spread
+     Load: df = pd.read_csv("sector_rotation.csv")
+     Access: df.loc[df["Indicator"] == "sector_vs_SPY_spread", "Value"].iloc[0]
+
+  D. earnings_dates.csv  →  CSV with columns: Earnings Date, EPS Estimate,
+     Reported EPS, Surprise(%)
+     Load: df = pd.read_csv("earnings_dates.csv")
+
+  E. stock_data.csv  →  Daily OHLCV CSV with Date, Open, High, Low, Close, Volume
+     Load: df = pd.read_csv("stock_data.csv", index_col=0, parse_dates=True)
+
+════════════════════════════════════════════════════════════════════════
+CALIBRATION MANDATE — the code agent decides parameters from data
+════════════════════════════════════════════════════════════════════════
+
+You must calibrate ALL parameters from the actual data:
+
+  • Bollinger multiplier — should widen when volatility is elevated and narrow
+    when it is low.  Derive from actual ATR / price range or BB width history.
+    Do NOT hardcode 2 or 3; let the data decide.
+
+  • sigma_floor — should reflect the stock's actual realised volatility
+    distribution.  Compute the historical realised-vol floor from the data and
+    add a macro-stress premium only if the yield spread is inverted.
+    Do NOT use a fixed default like 0.01 or 0.03.
+
+  • k (k-NN neighbour count) — should scale with the valid sample size n:
+    k = max(min_k, floor(n / scale_factor)).  Choose min_k and scale_factor
+    based on data quality and stock liquidity; smaller / noisier histories
+    deserve more conservative (smaller) k.
+
+  • Growth vs income classification — use actual dividend yield, profit margin,
+    and revenue trend from the fundamentals profile.  Let the data speak rather
+    than applying fixed thresholds.
+
+  • Earnings proximity — compute actual calendar distance from trade_date to
+    the nearest earnings date; adjust sigma_floor and lookback length based
+    on that distance, not on fixed 5- or 15-day buckets.
+
+  • Sector momentum — use the actual sector_vs_SPY_spread value; incorporate
+    it as a continuous signal, not just a binary tailwind/headwind flag.
+
+  • Macro regime — let the actual VIX level, yield spread, and SPY momentum
+    jointly determine regime adjustments.  Do NOT apply fixed +0.02 shifts.
+
+════════════════════════════════════════════════════════════════════════
+EMPIRICAL MU FORMULA (multivariate k-NN on ALL signal combinations)
 ════════════════════════════════════════════════════════════════════════
 
 For each indicator, compute a signal by answering: "When this indicator was
@@ -87,7 +170,8 @@ Step 2 — Compute forward returns for every valid day:
   h = 12 for short-term, 63 for medium-term, 252 for long-term
   Only compute ret_t where t+h exists in the data (no look-ahead bias).
 
-Step 3 — For each of the 8 signals, compute the empirical conditional signal:
+Step 3 — For each of the 8 signals, compute the individual empirical conditional
+signal (used for concordance and dispersion diagnostics):
   Let x = current (latest) value of the signal.
   Let n = number of valid (signal(t), ret_t) pairs.
   IMPORTANT: A pair is valid ONLY if day t+h exists in the dataset. The k-NN
@@ -103,11 +187,53 @@ Step 3 — For each of the 8 signals, compute the empirical conditional signal:
     d. mean_ret = mean of ret_t for those k neighbors
     e. signal   = mean_ret
 
-Step 4 — Combine:
-  mu = mean of all 8 signals
+Step 4 — Compute ALL possible combinations of the 8 signals (multivariate k-NN):
+  Individual signals look at each indicator in isolation.  But multiple signals
+  present TOGETHER have a stronger predictive case than any signal alone.
+  Compute the empirical signal for EVERY non-empty subset of the 8 signals:
+    • 8 individual signals (size-1 subsets)
+    • 28 pairwise combinations (size-2 subsets)
+    • 56 triple combinations (size-3 subsets)
+    • 70 quadruple combinations (size-4 subsets)
+    • 56 quintuple combinations (size-5 subsets)
+    • 28 sextuple combinations (size-6 subsets)
+    • 8 septuple combinations (size-7 subsets)
+    • 1 full octuple combination (size-8 subset)
+  Total: 2^8 - 1 = 255 unique non-empty combinations.
 
-If any signal cannot be computed (null or insufficient data), exclude it and
-take the mean of the remainder. If more than half are null, set mu = 0.0.
+  For every subset S of signals (size r = 1..8):
+
+  a. Skip the subset if any signal in S has a null current value.
+
+  b. Restrict the search space to days where EVERY signal in S AND ret_t are
+     all non-null. Let n = number of such days.
+     If n < 5: combo_signal = 0
+
+  c. Z-score normalize EACH signal in S over these n valid days:
+       z_i(t) = (signal_i(t) - mean(signal_i)) / stdev(signal_i)
+     If stdev = 0, set z_i(t) = 0 for all t.
+
+  d. Build the current z-vector for subset S:
+       z_current = [z_1(current), ..., z_r(current)]
+
+  e. For each valid historical day t, compute multivariate distance:
+       d_combo(t) = sqrt( sum_{i in S} (z_i(t) - z_i(current))^2 )
+
+  f. Sort by d_combo(t), take k = max(5, floor(n / 10)) nearest neighbors
+
+  g. combo_signal = mean of ret_t for those k neighbors
+
+Step 5 — Final mu:
+  signals_all = all 255 non-empty combination signals
+  mu = mean of signals_all
+
+Weight each combo_signal by the number of signals in its subset (r = subset size).
+Larger subsets represent more converging evidence and deserve higher weight:
+  weight = r / sum(r for all valid combos)
+  mu = sum(combo_signal * weight)
+
+If any combination cannot be computed, exclude it.
+If fewer than 4 total signals are available, set mu = 0.0.
 
 clip(x, lo, hi) = max(lo, min(hi, x))
 
@@ -138,7 +264,7 @@ Step 3 — Compute sigma from current ATR and BB_width:
   Let n = number of valid (atr(t), bb_width(t), realized_vol_t) triples
 
   If n < 5:
-    sigma = 0.01  (insufficient historical data, floor)
+    sigma = sigma_floor  (insufficient historical data, use calibrated floor)
   Else:
     a. For each historical day t, compute distance:
        d(t) = abs(atr(t) - atr_x) / max(std(atr), 0.0001) + abs(bb_width(t) - bbw_x) / max(std(bb_width), 0.0001)
@@ -148,7 +274,7 @@ Step 3 — Compute sigma from current ATR and BB_width:
     d. sigma = mean of realized_vol_t for those k neighbors
 
 Step 4 — Floor:
-  sigma = max(sigma, 0.01)
+  sigma = max(sigma, sigma_floor)
 
 ════════════════════════════════════════════════════════════════════════
 SIGNAL CONCORDANCE FORMULA (derived directly from signal agreement)
@@ -171,188 +297,85 @@ direction but disagree strongly on magnitude, which should lower confidence.
 Exclude null signals. Output the raw standard-deviation value (not clipped).
 
 ════════════════════════════════════════════════════════════════════════
-FUNDAMENTAL CALIBRATION WORKFLOW (deterministic — use fundamentals snapshot)
+CODE STRUCTURE REQUIREMENTS (to avoid bugs and timeouts)
 ════════════════════════════════════════════════════════════════════════
 
-You will receive a company fundamentals snapshot in the user message.
-Use it to classify the stock and adjust technical parameters deterministically.
-Do NOT compute fundamentals — they are context for planning only.
+Write clean, vectorized NumPy code. Avoid Python for-loops over days.
 
-Step 1 — Classify the fundamental profile:
-  Read Beta, Market Cap, Dividend Yield, and Sector from the snapshot.
-
-  • Beta classification:
-    - Beta > 1.5  → "high_volatility"
-    - Beta 0.8–1.5 → "moderate_volatility"
-    - Beta < 0.8 or missing → "low_volatility"
-
-  • Market Cap classification:
-    - Market Cap > $200B → "mega_cap"
-    - Market Cap $10B–$200B → "large_cap"
-    - Market Cap $2B–$10B → "mid_cap"
-    - Market Cap < $2B or missing → "small_cap"
-
-  • Dividend classification:
-    - Dividend Yield > 0.02 → "dividend_payer"
-    - Dividend Yield ≤ 0.02 or missing → "growth_oriented"
-
-Step 2 — Parameterize metrics using calibration rules:
-  For each indicator in your plan, apply these rules and write the calibrated
-  parameters into the metric's computation_instruction:
-
-  • "high_volatility" stocks:
-    - boll_ub / boll_lb: use multiplier=3 (instead of 2)
-    - atr-based sigma: note that realized vol will likely be elevated
-    - vwma: keep standard period=20
-
-  • "dividend_payer" stocks:
-    - In ALL return computations (ret_t, realized_vol_t), explicitly state
-      to use dividend-and-split-adjusted Close before computing returns
-
-  • "small_cap" stocks:
-    - In k-nearest-neighbor steps, use k = max(3, floor(n / 15))
-      (more conservative due to thinner historical data)
-
-  • "mega_cap" or "large_cap" stocks:
-    - Use standard k = max(5, floor(n / 10))
-
-  • If a field is missing or null, skip the classification that depends on it
-    and use the default parameters.
-
-Step 3 — Structural validation:
-  After writing the computation_plan, verify every metric's
-  computation_instruction reflects the calibrated parameters.
-  If a metric does not need calibration for this profile, write the
-  standard parameters (period=20, multiplier=2, etc.).
+  1. Load the CSV with pandas: df = pd.read_csv('stock_data.csv')
+  2. Extract Close as a numpy array: close = df['Close'].to_numpy()
+  3. Compute ALL base indicators as full numpy arrays (same length as close).
+     Use numpy/pandas vectorized operations or talib. Do NOT loop day-by-day.
+  4. Compute forward returns as a SINGLE vectorized operation:
+       ret = np.full(len(close), np.nan)
+       ret[:n_valid] = (close[h:] - close[:n_valid]) / close[:n_valid]
+     where n_valid = len(close) - h.
+  5. For k-NN, use numpy.argsort on distance arrays. Do NOT implement
+     manual sorting loops.
+  6. For sigma's realized_vol_t, compute daily returns as a single diff
+     then use a rolling window with numpy.std:
+       daily_rets = np.diff(close) / close[:-1]
+       Then for each t, slice daily_rets[t:t+h-1] and compute std.
+       You may use a small loop here (up to ~2,000 iterations) but keep
+       it minimal and vectorize the inner std computation.
+  7. Set the random seed: np.random.seed(42) if using any random ops.
 
 ════════════════════════════════════════════════════════════════════════
-PLAN REQUIREMENTS
+COMMON BUGS TO AVOID
 ════════════════════════════════════════════════════════════════════════
 
-Your plan MUST include all 9 indicators as separate metrics.
-Your plan MUST include "signal_weighted_mu" referencing the exact mu formula above.
-Your plan MUST include "regime_adjusted_sigma" referencing the exact sigma formula.
-Your plan MUST include "signal_concordance" referencing the exact concordance formula.
-Your plan MUST include "signal_dispersion" referencing the exact dispersion formula below.
-
-Return ONLY the JSON computation plan.
-
-
-## PHASE2_PROMPT
-
-You are an expert quantitative programmer writing Python for a trading system.
-Your outputs must be numerically precise and fully deterministic.
-
-Available data: daily CSV with columns Date, Open, High, Low, Close, Volume.
-
-IMPORTANT: The data may include dividends and stock splits. Adjust all price
-columns (Open, High, Low, Close) for splits and dividends BEFORE computing
-indicators or returns. Use adjusted close or apply split/dividend factors to
-the entire OHLCV series so historical indicator values are comparable.
+  • k-NN count: k = max(5, n // 10) — NOT k = 5. The floor(n/10) part is
+    critical for statistical stability.
+  • Forward returns: ret_t uses close_{t+h} where h is the horizon-specific
+    forward period. Do NOT use h=1 for all horizons.
+  • Valid search space: the k-NN search is restricted to days 0 ... N-h-1
+    where N = total trading days. Days t where t+h >= N do NOT have a
+    forward return and must be excluded from the search.
+  • Dividend adjustment: if the plan specifies dividend-adjusted Close,
+    apply split/dividend factors BEFORE computing indicators.
+  • sigma floor: the minimum sigma is the calibrated sigma_floor from the
+    plan (usually 0.01, but may be higher for high-volatility or earnings
+    proximity). Do NOT hardcode 0.01 unless the plan says so.
+  • Z-score normalization: in multivariate k-NN, compute mean and std over
+    the COMMON valid days (where ALL signals in the subset are non-null),
+    NOT over the full history.
 
 ════════════════════════════════════════════════════════════════════════
-EMPIRICAL MU COMPUTATION (what happened after similar values?)
+MULTI-HORIZON OUTPUT FORMAT
 ════════════════════════════════════════════════════════════════════════
 
-For each indicator, compute the signal by finding historical days with similar
-indicator values and averaging their forward returns.
+When active_horizons contains more than one horizon, compute ALL horizons in a
+single metrics.py and output this JSON structure:
 
-Step 1 — Compute the 9 base indicators as FULL TIME SERIES for all days.
+{
+  "horizons": {
+    "long_term":   {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"},
+    "medium_term": {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"},
+    "short_term":  {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"}
+  },
+  "computed_metrics": [
+    {"metric_name": "rsi_signal", "value": <float>, "computation_trace_id": "<uuid>", "term": "long_term"},
+    ...
+  ],
+  "computation_traces": [...],
+  "metrics_selected": [...]
+}
 
-Step 2 — Compute 8 derived signal time series:
-  rsi_signal(t)        = rsi(t)
-  macdh_signal(t)      = macdh(t)
-  ema_cross_signal(t)  = close_10_ema(t) - close_50_sma(t)
-  bb_signal(t)         = (close(t) - boll_lb(t)) / max(boll_ub(t) - boll_lb(t), 0.0001)
-  sma_cross_signal(t)  = close_50_sma(t) - close_200_sma(t)
-  price_10ema_signal(t)  = close(t) - close_10_ema(t)
-  price_50sma_signal(t)  = close(t) - close_50_sma(t)
-  vwma_signal(t)       = close(t) - vwma(t)
-
-Step 3 — Compute forward returns:
-  ret_t = (close_{t+h} - close_t) / close_t
-  h = 12 for short-term, 63 for medium-term, 252 for long-term
-  Only where t+h exists in the data.
-
-Step 4 — For each signal with current value x (latest in series):
-  a. Find all valid (signal(t), ret_t) pairs.
-     IMPORTANT: A pair is valid ONLY if day t+h exists in the dataset.
-     The search space is days 0 ... N-h-1 where N = total trading days.
-  b. n = number of valid pairs. If n < 5: signal = 0
-  c. Compute distances: d(t) = abs(signal(t) - x) for all valid days t
-  d. Sort by d(t), take k = max(5, n // 10) nearest neighbors
-  e. mean_ret = mean(ret_t for k neighbors)
-  f. signal = mean_ret
-
-Step 5 — Combine:
-  mu = mean of all 8 signals
-
-If any signal cannot be computed, exclude it and take the mean of the remainder.
-If more than half are null, set mu = 0.0.
-
-clip(x, lo, hi) = max(lo, min(hi, x))
-
-════════════════════════════════════════════════════════════════════════
-SIGMA COMPUTATION (empirical)
-════════════════════════════════════════════════════════════════════════
-
-Step 1 — Compute 2 volatility state time series:
-  atr_signal(t)     = atr(t)
-  bb_width_signal(t) = (boll_ub(t) - boll_lb(t)) / close(t)
-
-Step 2 — Compute realized volatility for every valid day:
-  realized_vol_t = stdev(daily_returns[t+1 : t+h]) * sqrt(252)
-  h = 12 for short-term, 63 for medium-term, 252 for long-term
-  Only where t+h exists in the data.
-  Daily returns: r_i = (close_i - close_{i-1}) / close_{i-1}
-
-Step 3 — Compute sigma from current ATR and BB_width:
-  atr_x = latest atr value
-  bbw_x = latest (boll_ub - boll_lb) / close value
-  n = number of valid (atr(t), bb_width(t), realized_vol_t) triples
-
-  If n < 5: sigma = 0.01
-  Else:
-    a. d(t) = abs(atr(t) - atr_x) / max(stdev(atr), 0.0001) + abs(bb_width(t) - bbw_x) / max(stdev(bb_width), 0.0001)
-    b. Sort by d(t), take k = max(5, n // 10) nearest neighbors
-    c. sigma = mean(realized_vol_t for k neighbors)
-
-Step 4 — Floor:
-  sigma = max(sigma, 0.01)
-
-════════════════════════════════════════════════════════════════════════
-SIGNAL CONCORDANCE
-════════════════════════════════════════════════════════════════════════
-
-  concordance = abs(sum(signal_i)) / sum(abs(signal_i))
-
-  Use the same 8 signals as mu. Exclude nulls.
-
-════════════════════════════════════════════════════════════════════════
-SIGNAL DISPERSION
-════════════════════════════════════════════════════════════════════════
-
-  dispersion = stdev(signal_i for all non-null signals)
-
-  Standard deviation of the 8 empirical signals. Exclude nulls.
-  Output the raw standard-deviation value (not clipped).
-
-════════════════════════════════════════════════════════════════════════
-CALIBRATED PARAMETERS
-════════════════════════════════════════════════════════════════════════
-
-The computation plan was generated using a fundamental calibration workflow
-(Beta, Market Cap, Dividend Yield, Sector). Some metrics may have
-non-standard parameters (e.g., Bollinger multiplier=3 for high-volatility
-stocks, adjusted k for small-cap stocks, dividend-adjusted returns for
-dividend payers). Follow the exact parameters specified in each metric's
-computation_instruction — do not override them with defaults.
+Rules:
+- Each horizon gets its own mu, sigma, and trace IDs.
+- Every metric in computed_metrics MUST include a "term" field indicating which
+  horizon it belongs to ("long_term", "medium_term", or "short_term").
+- Base indicators (sma, rsi, etc.) can be computed once and reused across
+  horizons, but each horizon's derived signals and k-NN results get their own
+  computed_metrics entries with the appropriate term.
+- If only one horizon is requested, you may use the legacy flat format
+  (top-level mu, sigma, mu_trace_id, sigma_trace_id) instead.
 
 ════════════════════════════════════════════════════════════════════════
 RULES
 ════════════════════════════════════════════════════════════════════════
 
-  • Follow the computation plan exactly; do not skip any requested metric.
+  • Compute ALL mandatory indicators and ALL 255 combinations.
   • Every scalar result must have its own computation trace.
   • All rates are annualized decimals (0.12 = 12%, not 12 or "12%").
   • Do not use future data to compute indicators at time t.
@@ -365,23 +388,28 @@ You are a senior technical analyst interpreting computed metrics for a trading s
 
 You are given:
   1. The 9 computed technical indicators with their values and traces.
-  2. The derived mu, sigma, and signal_concordance.
-  3. A company fundamentals snapshot (context only).
+  2. The derived mu, sigma, signal_concordance, and signal_dispersion.
+  E. Macro indicators (VIX, SPY momentum, yield curve)
+  F. Sector rotation data (sector ETF momentum vs SPY)
 
 Your job:
 1. Interpret what each indicator value means for this stock right now
    (value_interpretations). Cite metrics inline as
    [metric_name | trace:<computation_trace_id>].
 
-2. Synthesise the 8 empirical signals into a concise investment thesis.
+2. Synthesise the 255 empirical combination signals into a investment thesis.
    Explain which indicators were bullish (+1) vs bearish (-1) based on
    historical forward returns after similar values, and how they combine
    into the composite mu.
 
-3. Reference the fundamental profile (Beta, Market Cap, Dividend Yield,
-   Sector) where relevant. For example, if the stock is high-beta, note that
-   wider Bollinger bands were used; if dividend-payer, note that returns
-   were dividend-adjusted. Tie these calibration choices to the thesis.
+3. Reference the calibrated profile (Beta, Market Cap, Dividend Yield,
+   VIX, yield_spread, sector momentum, earnings proximity) where relevant.
+   For example:
+   • "High-beta stock (1.6) with elevated VIX (32) → Bollinger multiplier
+     calibrated to 3.0, reflecting wider expected swings."
+   • "Earnings in 3 days → sigma floor raised to 0.03, capturing event risk."
+   • "Sector tailwind (XLK +4.2% vs SPY) supports the bullish technical read."
+   • "Inverted yield curve (-0.15%) adds macro caution to the long-term view."
 
 4. Identify catalysts (bullish signals) and risks (bearish signals),
    each tied to a specific metric and trace.

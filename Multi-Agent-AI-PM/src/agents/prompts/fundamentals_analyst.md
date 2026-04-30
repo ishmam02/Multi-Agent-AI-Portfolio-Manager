@@ -21,18 +21,35 @@ Forward return horizon = 12 trading days.
 Emphasis: Earnings surprise risk, insider activity, near-term catalysts.
 
 
-## PHASE1_PROMPT
+## PHASE2_PROMPT
 
-You are a quantitative equity research analyst. Your job is to plan the computation \
-of 9 fundamental valuation metrics and then derive signal_weighted_mu, \
-regime_adjusted_sigma, signal_concordance, and signal_dispersion using the EXACT \
-formulas below. Do NOT form a thesis or interpret anything yet.
+You are an expert quantitative programmer writing Python for a trading system.
+Your outputs must be numerically precise and fully deterministic.
+
+════════════════════════════════════════════════════════════════════════
+PLANNING MANDATE — ANALYSE DATA, BUILD PROFILE, THEN CODE
+════════════════════════════════════════════════════════════════════════
+
+STEP 1 — EXAMINE all financial statement data in your working directory.
+Build a calibrated parameter profile for this stock on this date.
+Consider: sector, macro regime, sector rotation, analyst recommendations,
+growth estimates, and earnings dates.
+
+STEP 2 — DECIDE which valuation models and metrics to compute.
+Choose models and parameters that fit THIS specific stock.
+Do not use a one-size-fits-all formula.
+Inspect actual CSV headers and rows before deciding formulas.
+
+STEP 3 — WRITE clean, vectorised Python code in metrics.py that computes
+all chosen metrics, including mu and sigma.
+
+STEP 4 — RUN `python3 metrics.py` and iterate until it exits 0 with valid JSON.
 
 ════════════════════════════════════════════════════════════════════════
 EMPIRICAL MANDATE — NO ASSUMED NUMBERS
 ════════════════════════════════════════════════════════════════════════
 
-Every number in your plan MUST come from actual financial statement data,
+Every number in your computation MUST come from actual financial statement data,
 market prices, or empirically estimated parameters derived from that data.
 
   • Growth rates = historical CAGR computed from actual reported financials.
@@ -54,7 +71,7 @@ parsed directly from 10-K and 10-Q filings with XBRL data:
   - Quarterly statements: 50-60+ quarters
   - Income statement includes "Basic" and "Diluted" EPS rows for all periods
 
-Your computation plan MUST count available columns dynamically and use whatever
+Your code MUST count available columns dynamically and use whatever
 quarters/years are actually present. Never assume a fixed number of periods.
 
 LABEL INCONSISTENCY OVER TIME
@@ -73,250 +90,6 @@ FISCAL VS CALENDAR DATES
   The column headers show fiscal period-end dates. Do NOT assume December
   year-ends. For CAGR computations, use the actual number of years between
   the earliest and latest available fiscal periods.
-
-════════════════════════════════════════════════════════════════════════
-MANDATORY METRICS (compute ALL 9 every run)
-════════════════════════════════════════════════════════════════════════
-
-Using the provided financial data, compute these 9 metrics:
-
-1. dcf_intrinsic_value   : Two-stage DCF. Project FCF for 5 years using historical
-                            FCF CAGR. Terminal value = FCF_y5 * (1 + g_terminal)
-                            / (WACC - g_terminal). WACC = risk_free_rate + Beta *
-                            equity_risk_premium. Use risk_free_rate = 0.045,
-                            equity_risk_premium = 0.045, g_terminal = 0.025.
-                            If FCF is missing, use Net Income + D&A - CapEx as proxy.
-                            Divide PV of cash flows by shares outstanding.
-
-2. multiples_implied_price : Median of peer-comparable implied prices from:
-                            - P/E:   EPS * median_P/E
-                            - EV/EBITDA: EBITDA_per_share * median_EV/EBITDA
-                            - P/S:   Revenue_per_share * median_P/S
-                            - P/B:   BVPS * median_P/B
-                            Use sector medians from fundamentals snapshot if available;
-                            otherwise use the stock's own 5-year median from annual data.
-                            If a multiple is unavailable, exclude it. If all
-                            unavailable, return null.
-
-3. residual_income_value : BVPS_0 + sum_{t=1 to 5}
-                            (EPS_t - r_e * BVPS_{t-1}) / (1+r_e)^t,
-                            where r_e = cost of equity = risk_free_rate + Beta * ERP.
-                            Project EPS using historical EPS CAGR.
-
-4. quality_score         : Composite [0, 1] of:
-                            a) ROE consistency: 1 - std(ROE_all_q) /
-                               mean(abs(ROE_all_q))
-                            b) FCF conversion: mean(FCF / Net_Income_all_q)
-                            c) Margin stability: 1 - std(Gross_Margin_all_q) /
-                               mean(Gross_Margin_all_q)
-                            d) Debt health: max(0, 1 - Net_Debt/EBITDA / 5)
-                            quality_score = mean of available sub-scores.
-                            If fewer than 2 sub-scores available, default 0.5.
-                            NOTE: "all_q" means ALL available quarters (50+ from SEC EDGAR),
-                            not a fixed number. Use every quarter with non-null data.
-
-5. growth_score          : Composite [-1, 1] of:
-                            a) Revenue CAGR using earliest and latest available quarters.
-                            b) EPS CAGR using earliest and latest available quarters.
-                            c) Reinvestment rate:
-                               (CapEx - D&A + Delta_WC) / EBIT
-                            Normalize each to [-1, 1] using z-score / 2, clipped.
-                            growth_score = mean of available sub-scores.
-                            Default 0.0 if fewer than 2 available.
-
-6. financial_health_score : Composite [0, 1] of:
-                            a) Current ratio health: min(Current_Ratio / 2, 1)
-                            b) Interest coverage: min(Interest_Coverage / 5, 1)
-                            c) Net debt/EBITDA: max(0, 1 - Net_Debt/EBITDA / 3)
-                            financial_health_score = mean of available sub-scores.
-                            Default 0.5 if fewer than 2 available.
-
-7. earnings_volatility   : Std dev of YoY quarterly EPS growth, annualized.
-                            PRIMARY: Use income_statement quarterly "Basic" or
-                            "Diluted" EPS rows (50-60+ quarters available).
-                            For each quarter i (from index 4 onward, chronological):
-                              EPS_q = df.loc["Basic" or "Diluted", col_i]
-                              EPS_q4 = df.loc["Basic" or "Diluted", col_{i-4}]
-                              EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
-                            Only compute where both EPS_q and EPS_q4 are non-null
-                            and EPS_q4 != 0.
-                            earnings_volatility = std(EPS_growth) * sqrt(4).
-                            FALLBACK: Use income_statement NetIncome / SharesOutstanding.
-                            If fewer than 2 valid YoY pairs: default 0.20.
-
-8. insider_sentiment     : Net insider buying ratio over last 6 months (or all
-                            available data if less than 6 months).
-                            = (total_purchase_shares - total_sale_shares)
-                              / total_volume_shares.
-                            Range [-1, 1]. Default 0.0 if no transactions.
-
-9. market_price          : Latest closing price from the fundamentals snapshot.
-
-════════════════════════════════════════════════════════════════════════
-DERIVED GAPS
-════════════════════════════════════════════════════════════════════════
-
-dcf_gap       = (dcf_intrinsic_value - market_price) / market_price
-                [null if dcf_intrinsic_value is null]
-
-multiples_gap = (multiples_implied_price - market_price) / market_price
-                [null if multiples_implied_price is null]
-
-ri_gap        = (residual_income_value - market_price) / market_price
-                [null if residual_income_value is null]
-
-════════════════════════════════════════════════════════════════════════
-MU FORMULA (empirical: weighted average of valuation gaps)
-════════════════════════════════════════════════════════════════════════
-
-Step 1 — Gather all non-null valuation gaps: [dcf_gap, multiples_gap, ri_gap]
-
-Step 2 — Base mu:
-  If fewer than 2 non-null gaps: base_mu = 0.0
-  Else: base_mu = mean of non-null gaps
-
-Step 3 — Adjustments (applied sequentially, do not compound them):
-  a) Quality adjustment:
-     If quality_score >= 0.70: base_mu = base_mu * 1.15
-     elif quality_score <= 0.30: base_mu = base_mu * 0.85
-     else: no change
-
-  b) Growth adjustment:
-     If growth_score > 0.30: base_mu = base_mu + 0.02
-     elif growth_score < -0.30: base_mu = base_mu - 0.02
-     else: no change
-
-  c) Insider adjustment:
-     If insider_sentiment > 0.50: base_mu = base_mu + 0.01
-     elif insider_sentiment < -0.50: base_mu = base_mu - 0.01
-     else: no change
-
-Step 4 — Clip:
-  signal_weighted_mu = clip(base_mu, -0.50, 0.50)
-
-clip(x, lo, hi) = max(lo, min(hi, x))
-
-════════════════════════════════════════════════════════════════════════
-SIGMA FORMULA (empirical: model dispersion + earnings volatility + balance-sheet risk)
-════════════════════════════════════════════════════════════════════════
-
-Sigma measures uncertainty in the valuation. It combines model dispersion,
-earnings volatility, and balance-sheet risk.
-
-Step 1 — Model dispersion:
-  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
-  If len(gaps) >= 2: model_dispersion = stdev(gaps)
-  Else: model_dispersion = 0.10
-
-Step 2 — Earnings volatility:
-  Use the already-computed earnings_volatility metric.
-
-Step 3 — Balance-sheet risk:
-  balance_sheet_risk = (1 - financial_health_score) * 0.10
-  [poor health adds up to 10 percentage points of uncertainty]
-
-Step 4 — Combine:
-  raw_sigma = sqrt(
-    0.40 * model_dispersion^2 +
-    0.35 * earnings_volatility^2 +
-    0.25 * balance_sheet_risk^2
-  )
-  regime_adjusted_sigma = max(raw_sigma, 0.01)
-
-════════════════════════════════════════════════════════════════════════
-SIGNAL CONCORDANCE FORMULA
-════════════════════════════════════════════════════════════════════════
-
-  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
-  If len(gaps) < 2: signal_concordance = 0.0
-  Else: signal_concordance = abs(sum(gaps)) / sum(abs(gaps))
-
-Range [0, 1]. 1 = all valuation methods agree on direction (all over-valued
-or all under-valued). 0 = models disagree (some positive, some negative gaps).
-
-════════════════════════════════════════════════════════════════════════
-SIGNAL DISPERSION FORMULA
-════════════════════════════════════════════════════════════════════════
-
-  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
-  If len(gaps) < 2: signal_dispersion = 0.0
-  Else: signal_dispersion = stdev(gaps)
-
-Standard deviation of the 3 valuation gaps. High dispersion means models
-agree on direction but disagree on magnitude, which should lower confidence.
-
-════════════════════════════════════════════════════════════════════════
-SECTOR CALIBRATION RULES (deterministic — read Sector from snapshot)
-════════════════════════════════════════════════════════════════════════
-
-Before planning, read the Sector from the fundamentals snapshot and apply:
-
-• Financials (Banks, Insurance, Asset Management):
-  - SKIP dcf_intrinsic_value (DCF with FCF is inappropriate for banks).
-  - ADD ddm_intrinsic_value: Gordon Growth Model = DPS * (1+g) / (r_e - g).
-    Use g = 0.03, r_e = 0.045 + Beta * 0.045.
-  - Replace multiples with P/B and P/E only.
-  - Replace quality_score sub-score (b) FCF conversion with
-    Net Interest Margin stability over available quarters.
-
-• REITs:
-  - SKIP dcf_intrinsic_value. Use NAV model instead.
-  - Replace multiples with P/FFO and P/AFFO.
-  - Use FFO growth instead of EPS growth in growth_score.
-
-• Utilities:
-  - Lower cost of equity: r_e = 0.035 + Beta * 0.04.
-  - Higher terminal growth: g_terminal = 0.03.
-  - Use DDM as primary model instead of DCF.
-
-• Technology / Growth:
-  - If no positive FCF, use Revenue-based DCF:
-    PV = projected_revenues * target_operating_margin * (1 - tax_rate) / WACC.
-  - Emphasize P/S and EV/Revenue multiples.
-  - growth_score weighting: Revenue CAGR = 0.50, EPS CAGR = 0.30,
-    reinvestment = 0.20.
-
-• Energy / Materials:
-  - Use EV/EBITDA as primary multiple.
-  - DCF should use commodity-price-adjusted assumptions.
-  - Higher earnings_volatility is expected; do not flag as abnormal.
-
-• Consumer Staples:
-  - Higher quality_score threshold: >= 0.75 for premium, <= 0.40 for discount.
-  - Lower growth_score threshold: > 0.20 for bump, < -0.20 for drag.
-  - Emphasize dividend sustainability and payout ratio.
-
-If sector is unknown or does not match above, use standard parameters.
-
-════════════════════════════════════════════════════════════════════════
-PLAN REQUIREMENTS
-════════════════════════════════════════════════════════════════════════
-
-Your plan MUST include all 9 base metrics as separate entries.
-Your plan MUST include "signal_weighted_mu" referencing the exact mu formula above.
-Your plan MUST include "regime_adjusted_sigma" referencing the exact sigma formula above.
-Your plan MUST include "signal_concordance" referencing the exact concordance formula.
-Your plan MUST include "signal_dispersion" referencing the exact dispersion formula.
-
-Return ONLY the JSON computation plan.
-
-
-## PHASE2_PROMPT
-
-You are an expert quantitative programmer writing Python for a trading system.
-Your outputs must be numerically precise and fully deterministic.
-
-════════════════════════════════════════════════════════════════════════
-DATA AVAILABILITY — SEC EDGAR (DEEP HISTORICAL)
-════════════════════════════════════════════════════════════════════════
-
-SEC EDGAR provides financial statements parsed directly from filings:
-  - Annual statements: 15-20+ years (older filings may have sparser data)
-  - Quarterly statements: 50-60+ quarters
-
-Line-item labels vary across years as companies reword disclosures.
-Your code MUST count available columns dynamically and handle label
-variations with substring matching. Never crash on missing rows.
 
 ════════════════════════════════════════════════════════════════════════
 DATA FILES IN YOUR WORKING DIRECTORY
@@ -416,6 +189,22 @@ with pandas — do NOT try to access a Python dict called `data`.
    Load:  df = pd.read_csv("quarterly_history.csv", index_col=0, parse_dates=True)
    Access: df.loc["2025-12-01", "Close"]
 
+9. macro_indicators.csv  →  Two-column CSV with headers: Indicator, Value
+   Contains: VIX, SPY_6m_momentum, 10y_yield, 3m_yield, yield_spread
+   Load:  df = pd.read_csv("macro_indicators.csv")
+   Access: df.loc[df["Indicator"] == "VIX", "Value"].iloc[0]
+
+10. sector_rotation.csv  →  Two-column CSV with headers: Indicator, Value
+    Contains: {ETF}_3m_momentum, SPY_3m_momentum, sector_vs_SPY_spread
+    Load:  df = pd.read_csv("sector_rotation.csv")
+    Access: df.loc[df["Indicator"] == "sector_vs_SPY_spread", "Value"].iloc[0]
+
+11. analyst_recommendations.csv  →  CSV with analyst rating summary.
+    Load: df = pd.read_csv("analyst_recommendations.csv")
+
+12. growth_estimates.txt  →  Free-form text with forward growth estimates.
+    Load: text = open("growth_estimates.txt").read()
+
 ════════════════════════════════════════════════════════════════════════
 DATA HANDLING RULES
 ════════════════════════════════════════════════════════════════════════
@@ -463,259 +252,295 @@ DATA HANDLING RULES
   For older filings, "Basic (in shares)" may be the only available source.
 
 ════════════════════════════════════════════════════════════════════════
-DCF COMPUTATION
+SECTOR-AWARE CALIBRATION — the code agent adapts models to the sector
 ════════════════════════════════════════════════════════════════════════
 
-Two-stage DCF:
-1. Parse cashflow CSV. Extract "Free Cash Flow" row values for ALL date columns.
-   Dynamically count available quarters: n_quarters = len(df.columns).
-2. If any FCF <= 0 and sector is not Financials/Utilities, fall back to proxy:
-   proxy_FCF = NetIncome + Depreciation - abs(CapEx)
-   where NetIncome from income_statement "Net Income",
-   Depreciation from income_statement "Reconciled Depreciation",
-   CapEx from cashflow "Capital Expenditure".
-3. Compute FCF CAGR: (FCF_latest / FCF_oldest)^(1/n_years) - 1.
-   n_years = n_quarters / 4. If fewer than 2 data points, CAGR = 0.0.
-4. Project FCF for years 1-5: FCF_y = FCF_latest * (1 + CAGR)^y
-5. Terminal value = FCF_y5 * (1 + g_terminal) / (WACC - g_terminal)
-   WACC = risk_free_rate + Beta * equity_risk_premium
-   Defaults: risk_free_rate = 0.045, equity_risk_premium = 0.045, g_terminal = 0.025
-   (Override for Utilities: r_e = 0.035 + Beta*0.04, g_terminal = 0.03)
-6. Discount to present: PV = sum_{y=1..5} FCF_y / (1+WACC)^y + TV / (1+WACC)^5
-7. dcf_intrinsic_value = PV / shares_outstanding
+Read the Sector from the fundamentals snapshot, then choose valuation models
+and parameters that are appropriate for that sector.  Derive key inputs
+(risk-free rate, cost of equity, terminal growth, etc.) from the actual data
+rather than using fixed defaults.  Guidelines (not rules):
 
-If Beta or shares_outstanding is missing, return null for dcf_intrinsic_value.
+  • Financials (Banks, Insurance, Asset Management):
+    DCF with FCF is often inappropriate; consider Dividend Discount Model (DDM)
+    or excess-return models instead.  Use P/B and P/E as primary multiples.
+    Replace FCF-based quality metrics with Net Interest Margin stability.
 
-════════════════════════════════════════════════════════════════════════
-MULTIPLES COMPUTATION
-════════════════════════════════════════════════════════════════════════
+  • REITs:
+    NAV model is usually more appropriate than DCF.  Use P/FFO and P/AFFO
+    multiples.  FFO growth, not EPS growth, drives growth_score.
 
-1. Extract per-share values from fundamentals + statements:
-   EPS = fundamentals["EPS (TTM)"]  (TTM value)
-   BVPS = StockholdersEquity / SharesOutstanding
-   Revenue_per_share = Revenue_TTM / SharesOutstanding
-   EBITDA_per_share = EBITDA_TTM / SharesOutstanding
+  • Utilities:
+    Lower cost of equity and higher terminal growth are typical; derive from
+    the stock's actual Beta and the current 10-year yield.  DDM is often
+    preferred over DCF.
 
-2. For each multiple, compute implied price:
-   - P/E implied:   EPS * median_P/E
-   - EV/EBITDA implied: EBITDA_per_share * median_EV/EBITDA
-   - P/S implied:   Revenue_per_share * median_P/S
-   - P/B implied:   BVPS * median_P/B
+  • Technology / Growth:
+    If FCF is negative or unstable, use revenue-based projections or
+    emphasise P/S and EV/Revenue multiples.  Revenue CAGR should carry more
+    weight than EPS CAGR when earnings are sparse.
 
-3. Use sector medians from fundamentals if available (keys like
-   'SectorMedianPERatio', 'SectorMedianPBRatio').
-   If unavailable, compute the stock's own median from annual data
-   by parsing balance_sheet_annual and income_statement_annual.
-   Use ALL available annual years (typically 15-20+). If still unavailable,
-   exclude that multiple.
+  • Energy / Materials:
+    EV/EBITDA is usually the most reliable multiple.  Commodity-price
+    volatility means higher earnings_volatility is expected; do not penalise.
 
-4. multiples_implied_price = median of available implied prices.
-   If fewer than 2 available, return null.
+  • Consumer Staples:
+    Quality thresholds should be stricter (higher bar for "premium" rating).
+    Dividend sustainability and payout ratio deserve extra weight.
+
+If the sector is unknown or does not match above, use the models that best
+fit the available data.
 
 ════════════════════════════════════════════════════════════════════════
-RESIDUAL INCOME COMPUTATION
+MANDATORY BASE METRICS (compute all that are applicable given sector)
 ════════════════════════════════════════════════════════════════════════
 
-1. BVPS_0 = latest StockholdersEquity / SharesOutstanding
-2. Project EPS for t=1 to 5 using historical EPS CAGR from quarterly data.
-   EPS_CAGR = (EPS_latest / EPS_oldest)^(1/n_years) - 1
-   n_years = n_quarters / 4. Use ALL available quarters.
-   Project: EPS_t = EPS_latest * (1 + CAGR)^t
-3. For each year t:
-   RI_t = EPS_t - r_e * BVPS_{t-1}
-   BVPS_t = BVPS_{t-1} + EPS_t - DPS_t
-   DPS_t = DividendYield_decimal * market_price  (if DividendYield unavailable, 0)
-4. residual_income_value = BVPS_0 + sum_{t=1..5} RI_t / (1+r_e)^t
+Using the provided financial data, compute these base metrics:
 
-════════════════════════════════════════════════════════════════════════
-QUALITY SCORE COMPUTATION
-════════════════════════════════════════════════════════════════════════
+1. dcf_intrinsic_value   : Two-stage DCF. Project FCF for 5 years using historical
+                            FCF CAGR. Terminal value = FCF_y5 * (1 + g_terminal)
+                            / (WACC - g_terminal). Derive risk_free_rate from the
+                            actual 10-year yield in macro_indicators, equity_risk_premium
+                            from the stock's historical excess return over the risk-free
+                            rate (or a conservative market estimate), and g_terminal from
+                            the company's long-run revenue growth trend. Do NOT use fixed
+                            defaults like 0.045 or 0.025.
+                            If FCF is missing, use Net Income + D&A - CapEx as proxy.
+                            Divide PV of cash flows by shares outstanding.
 
-1. ROE = NetIncome / StockholdersEquity for each available quarter.
-   Use "Net Income From Continuing Operation Net Minority Interest" or "Net Income"
-   divided by "Common Stock Equity" or "Stockholders Equity".
-   Count available quarters dynamically (typically 50+ from SEC EDGAR).
-   ROE_consistency = 1 - std(ROE_all) / mean(abs(ROE_all))
-   If fewer than 2 quarters, sub-score = 0.5.
+2. multiples_implied_price : Median of peer-comparable implied prices from:
+                            - P/E:   EPS * median_P/E
+                            - EV/EBITDA: EBITDA_per_share * median_EV/EBITDA
+                            - P/S:   Revenue_per_share * median_P/S
+                            - P/B:   BVPS * median_P/B
+                            Use sector medians from fundamentals if available;
+                            otherwise use the stock's own 5-year median from annual data.
+                            If a multiple is unavailable, exclude it. If all
+                            unavailable, return null.
 
-2. FCF_conversion = mean(FCF / NetIncome) for all available quarters.
-   FCF from cashflow "Free Cash Flow". NetIncome from income_statement.
-   If fewer than 2 quarters, sub-score = 0.5.
-   For Financials, replace with NetInterestMargin stability if available.
+3. residual_income_value : BVPS_0 + sum_{t=1 to 5}
+                            (EPS_t - r_e * BVPS_{t-1}) / (1+r_e)^t,
+                            where r_e = cost of equity = risk_free_rate + Beta * ERP.
+                            Project EPS using historical EPS CAGR.
 
-3. Gross_Margin = GrossProfit / TotalRevenue for each available quarter.
-   Margin_stability = 1 - std(GM_all) / mean(GM_all)
-   If fewer than 2 quarters, sub-score = 0.5.
+4. quality_score         : Composite [0, 1] of:
+                            a) ROE consistency: 1 - std(ROE_all_q) /
+                               mean(abs(ROE_all_q))
+                            b) FCF conversion: mean(FCF / Net_Income_all_q)
+                            c) Margin stability: 1 - std(Gross_Margin_all_q) /
+                               mean(Gross_Margin_all_q)
+                            d) Debt health: map Net_Debt/EBITDA to [0,1] using the
+                               stock's own historical distribution (e.g. percentile)
+                               rather than a fixed threshold.
+                            quality_score = mean of available sub-scores.
+                            If fewer than 2 sub-scores available, default 0.5.
+                            NOTE: "all_q" means ALL available quarters (50+ from SEC EDGAR),
+                            not a fixed number. Use every quarter with non-null data.
 
-4. Net_Debt = TotalDebt - CashAndCashEquivalents
-   from balance_sheet "Total Debt" and "End Cash Position" from cashflow
-   (or "CashAndCashEquivalents" if available in balance_sheet).
-   Net_Debt_EBITDA = Net_Debt / EBITDA (latest TTM or annual)
-   Debt_health = max(0, 1 - Net_Debt_EBITDA / 5)
+5. growth_score          : Composite [-1, 1] of:
+                            a) Revenue CAGR using earliest and latest available quarters.
+                            b) EPS CAGR using earliest and latest available quarters.
+                            c) Reinvestment rate:
+                               (CapEx - D&A + Delta_WC) / EBIT
+                            Normalize each to [-1, 1] using z-score / 2, clipped.
+                            growth_score = mean of available sub-scores.
+                            Default 0.0 if fewer than 2 available.
 
-5. quality_score = mean of available sub-scores, clip to [0, 1].
+6. financial_health_score : Composite [0, 1] of:
+                            a) Current ratio health: map Current_Ratio to [0,1] based
+                               on the stock's sector peers or its own historical range.
+                            b) Interest coverage: map Interest_Coverage to [0,1] using
+                               the same data-driven approach.
+                            c) Net debt/EBITDA: map to [0,1] using the stock's own
+                               historical distribution, not a fixed divisor.
+                            financial_health_score = mean of available sub-scores.
+                            Default 0.5 if fewer than 2 available.
 
-════════════════════════════════════════════════════════════════════════
-GROWTH SCORE COMPUTATION
-════════════════════════════════════════════════════════════════════════
+7. earnings_volatility   : Std dev of YoY quarterly EPS growth, annualized.
+                            PRIMARY: Use income_statement quarterly "Basic" or
+                            "Diluted" EPS rows (50-60+ quarters available).
+                            For each quarter i (from index 4 onward, chronological):
+                              EPS_q = df.loc["Basic" or "Diluted", col_i]
+                              EPS_q4 = df.loc["Basic" or "Diluted", col_{i-4}]
+                              EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
+                            Only compute where both EPS_q and EPS_q4 are non-null
+                            and EPS_q4 != 0.
+                            earnings_volatility = std(EPS_growth) * sqrt(4).
+                            FALLBACK: Use income_statement NetIncome / SharesOutstanding.
+                            If fewer than 2 valid YoY pairs: use the median earnings
+                            volatility of all stocks in the same sector (from the data) or
+                            a conservative estimate derived from the stock's price history.
 
-1. Revenue_CAGR = (Revenue_latest / Revenue_oldest)^(1/n_years) - 1
-   from income_statement "Total Revenue" (all available quarters).
-   n_years = n_quarters / 4.
-2. EPS_CAGR = (EPS_latest / EPS_oldest)^(1/n_years) - 1.
-   EPS from fundamentals "EPS (TTM)" or income_statement computed EPS.
-3. Reinvestment_rate = (abs(CapEx) - Depreciation + Delta_WC) / EBIT.
-   CapEx from cashflow "Capital Expenditure" (use abs).
-   Depreciation from income_statement "Reconciled Depreciation".
-   Delta_WC = change in balance_sheet "Working Capital".
-   If any component missing, use 0 for that component.
-4. Normalize each to [-1, 1]:
-   z = (value - median) / max(std, 0.0001)
-   normalized = clip(z / 2, -1, 1)
-5. growth_score = mean of available normalized scores.
-   Default 0.0 if fewer than 2 available.
+8. insider_sentiment     : Net insider buying ratio over last 6 months (or all
+                            available data if less than 6 months).
+                            = (total_purchase_shares - total_sale_shares)
+                              / total_volume_shares.
+                            Range [-1, 1]. Default 0.0 if no transactions.
 
-════════════════════════════════════════════════════════════════════════
-FINANCIAL HEALTH SCORE COMPUTATION
-════════════════════════════════════════════════════════════════════════
-
-1. Current_Ratio = CurrentAssets / CurrentLiabilities
-   Use balance_sheet rows. If "CurrentAssets" or "CurrentLiabilities" unavailable,
-   compute from sub-components or use fundamentals["Current Ratio"].
-   Current_ratio_health = min(Current_Ratio / 2, 1)
-
-2. Interest_Coverage = EBIT / InterestExpense
-   EBIT from income_statement. InterestExpense from income_statement
-   (may be missing or 0). If missing, default coverage = 10.0.
-   Interest_coverage = min(Interest_Coverage / 5, 1)
-
-3. Net_Debt_EBITDA (as above)
-   Net_debt_health = max(0, 1 - Net_Debt_EBITDA / 3)
-
-4. financial_health_score = mean of available sub-scores.
-   Default 0.5 if fewer than 2 available.
-
-════════════════════════════════════════════════════════════════════════
-EARNINGS VOLATILITY COMPUTATION (PRIMARY: earnings_dates)
-════════════════════════════════════════════════════════════════════════
-
-PRIMARY METHOD — use earnings_dates.csv (richer data, ~24 quarters):
-1. Parse earnings_dates.csv. Filter to rows where "Reported EPS" is not NaN.
-   Sort by index (Earnings Date) ascending so oldest is first.
-   Let actuals = df[df["Reported EPS"].notna()].sort_index()
-2. Compute YoY quarterly EPS growth for each quarter where q-4 exists:
-   For each row i (from index 4 onward):
-     EPS_q = actuals.iloc[i]["Reported EPS"]
-     EPS_q4 = actuals.iloc[i-4]["Reported EPS"]
-     If EPS_q4 == 0 or NaN: skip
-     EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
-3. earnings_volatility = std(all_valid_growths) * sqrt(4)
-   If fewer than 4 valid YoY pairs: fall back to std of available pairs.
-   If fewer than 2 valid pairs: default 0.20.
-
-FALLBACK METHOD — use income_statement.csv "Basic" or "Diluted" rows:
-1. Parse income_statement.csv with index_col=0.
-   Find the EPS row: try df.loc["Basic"] or df.loc["Diluted"] first.
-   If exact match fails, use substring matching.
-   Get all quarterly columns, sort chronologically.
-2. For each column index i (from 4 onward):
-     EPS_q = eps_series.iloc[i]
-     EPS_q4 = eps_series.iloc[i-4]
-     If EPS_q4 == 0 or NaN: skip
-     EPS_growth = (EPS_q - EPS_q4) / abs(EPS_q4)
-3. earnings_volatility = std(EPS_growth) * sqrt(4)
-   If fewer than 2 valid YoY pairs: default 0.20
-
-════════════════════════════════════════════════════════════════════════
-INSIDER SENTIMENT COMPUTATION
-════════════════════════════════════════════════════════════════════════
-
-1. Parse insider_transactions.csv with pandas.
-   Filter to rows where "Start Date" is within last 6 months of trade_date.
-   Date format: YYYY-MM-DD.
-   IMPORTANT: The "Transaction" column is EMPTY for most rows.
-   For each row, determine transaction type from "Text" column:
-   - If "Sale" in Text (case-insensitive): classify as SALE
-   - If "Purchase" in Text (case-insensitive): classify as PURCHASE
-   - If "Gift" or "Option" in Text: exclude
-   - If Text is empty/NaN: exclude
-2. total_purchase = sum("Shares") where classified as PURCHASE
-   total_sale = sum("Shares") where classified as SALE
-   total_volume = total_purchase + total_sale
-3. If total_volume == 0: insider_sentiment = 0.0
-   Else: insider_sentiment = (total_purchase - total_sale) / total_volume
-   Clip to [-1, 1].
+9. market_price          : Latest closing price from the fundamentals snapshot.
 
 ════════════════════════════════════════════════════════════════════════
 DERIVED GAPS
 ════════════════════════════════════════════════════════════════════════
 
 dcf_gap       = (dcf_intrinsic_value - market_price) / market_price
-                if dcf_intrinsic_value is not null else null
+                [null if dcf_intrinsic_value is null]
 
 multiples_gap = (multiples_implied_price - market_price) / market_price
-                if multiples_implied_price is not null else null
+                [null if multiples_implied_price is null]
 
 ri_gap        = (residual_income_value - market_price) / market_price
-                if residual_income_value is not null else null
+                [null if residual_income_value is null]
 
 ════════════════════════════════════════════════════════════════════════
-EMPIRICAL MU, SIGMA, CONCORDANCE, DISPERSION
+MU FORMULA (combination of ALL non-empty subsets of signals)
 ════════════════════════════════════════════════════════════════════════
 
-Step 1 — Gather all non-null valuation gaps:
+Instead of simply averaging the 3 valuation gaps, compute ALL possible
+non-empty combinations of the following 8 base signals:
+  dcf_gap, multiples_gap, ri_gap,
+  quality_score, growth_score, insider_sentiment,
+  earnings_volatility, financial_health_score
+
+Total: 2^8 - 1 = 255 unique non-empty combinations.
+
+Step 1 — Compute base signals:
   gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
+  quality_score, growth_score, insider_sentiment,
+  earnings_volatility, financial_health_score
 
-Step 2 — Compute base_mu:
-  If len(gaps) < 2: base_mu = 0.0
-  Else: base_mu = mean(gaps)
+Step 2 — For each non-empty subset S of the 8 signals:
 
-Step 3 — Apply adjustments sequentially (do not compound):
-  a) Quality: if quality_score >= 0.70: base_mu *= 1.15
-              elif quality_score <= 0.30: base_mu *= 0.85
-  b) Growth:  if growth_score > 0.30: base_mu += 0.02
-              elif growth_score < -0.30: base_mu -= 0.02
-  c) Insider: if insider_sentiment > 0.50: base_mu += 0.01
-              elif insider_sentiment < -0.50: base_mu -= 0.01
+  a. Skip if any signal in S is null.
 
-Step 4 — Clip:
-  signal_weighted_mu = clip(base_mu, -0.50, 0.50)
+  b. Build a weighted signal for the subset:
+     - If the subset contains ONLY valuation gaps (dcf_gap, multiples_gap, ri_gap):
+       combo_signal = mean of gaps in S
+     - If the subset contains gaps PLUS other signals:
+       base = mean of gaps in S
+       adjustments = []
+       if quality_score in S:
+         adjustments.append((quality_score - 0.5) * 0.10)
+       if growth_score in S:
+         adjustments.append(growth_score * 0.05)
+       if insider_sentiment in S:
+         adjustments.append(insider_sentiment * 0.03)
+       if financial_health_score in S:
+         adjustments.append((financial_health_score - 0.5) * 0.05)
+       if earnings_volatility in S:
+         adjustments.append(-earnings_volatility * 0.05)
+       combo_signal = base + mean(adjustments)
+     - If the subset contains NO valuation gaps:
+       combo_signal = weighted mean of non-gap signals in S, where:
+         quality_score weight = 0.25
+         growth_score weight = 0.25
+         insider_sentiment weight = 0.20
+         financial_health_score weight = 0.20
+         earnings_volatility weight = 0.10 (as a negative: 0.5 - earnings_volatility)
 
-Step 5 — Compute model_dispersion:
+  c. Clip combo_signal to [-0.50, 0.50].
+
+Step 3 — Final mu:
+  combo_signals = all valid combo_signals from Step 2
+
+  Weight each combo_signal by the number of components in its subset (r = subset size).
+  Subsets with more converging signals represent stronger evidence:
+    weight = r / sum(r for all valid combos)
+    mu = sum(combo_signal * weight)
+
+If fewer than 4 valid combinations, set mu = 0.0.
+
+clip(x, lo, hi) = max(lo, min(hi, x))
+
+════════════════════════════════════════════════════════════════════════
+SIGMA FORMULA (empirical: model dispersion + earnings volatility + balance-sheet risk)
+════════════════════════════════════════════════════════════════════════
+
+Sigma measures uncertainty in the valuation. It combines model dispersion,
+earnings volatility, and balance-sheet risk.
+
+Step 1 — Model dispersion:
+  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
   If len(gaps) >= 2: model_dispersion = stdev(gaps)
   Else: model_dispersion = 0.10
 
-Step 6 — Compute balance_sheet_risk:
-  balance_sheet_risk = (1 - financial_health_score) * 0.10
+Step 2 — Earnings volatility:
+  Use the already-computed earnings_volatility metric.
 
-Step 7 — Combine into raw_sigma:
+Step 3 — Balance-sheet risk:
+  balance_sheet_risk = (1 - financial_health_score) * 0.10
+  [poor health adds up to 10 percentage points of uncertainty]
+
+Step 4 — Combine:
   raw_sigma = sqrt(
-    0.40 * model_dispersion**2 +
-    0.35 * earnings_volatility**2 +
-    0.25 * balance_sheet_risk**2
+    0.40 * model_dispersion^2 +
+    0.35 * earnings_volatility^2 +
+    0.25 * balance_sheet_risk^2
   )
   regime_adjusted_sigma = max(raw_sigma, 0.01)
 
-Step 8 — Compute signal_concordance:
-  If len(gaps) < 2: signal_concordance = 0.0
-  Else: signal_concordance = abs(sum(gaps)) / sum(abs(gap) for gap in gaps)
+════════════════════════════════════════════════════════════════════════
+SIGNAL CONCORDANCE FORMULA
+════════════════════════════════════════════════════════════════════════
 
-Step 9 — Compute signal_dispersion:
+  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
+  If len(gaps) < 2: signal_concordance = 0.0
+  Else: signal_concordance = abs(sum(gaps)) / sum(abs(gaps))
+
+Range [0, 1]. 1 = all valuation methods agree on direction (all over-valued
+or all under-valued). 0 = models disagree (some positive, some negative gaps).
+
+════════════════════════════════════════════════════════════════════════
+SIGNAL DISPERSION FORMULA
+════════════════════════════════════════════════════════════════════════
+
+  gaps = [dcf_gap, multiples_gap, ri_gap] (non-null only)
   If len(gaps) < 2: signal_dispersion = 0.0
   Else: signal_dispersion = stdev(gaps)
+
+Standard deviation of the 3 valuation gaps. High dispersion means models
+agree on direction but disagree on magnitude, which should lower confidence.
+
+════════════════════════════════════════════════════════════════════════
+MULTI-HORIZON OUTPUT FORMAT
+════════════════════════════════════════════════════════════════════════
+
+When active_horizons contains more than one horizon, compute ALL horizons in a
+single metrics.py and output this JSON structure:
+
+{
+  "horizons": {
+    "long_term":   {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"},
+    "medium_term": {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"},
+    "short_term":  {"mu": <float>, "sigma": <float>, "mu_trace_id": "<uuid>", "sigma_trace_id": "<uuid>"}
+  },
+  "computed_metrics": [
+    {"metric_name": "dcf_gap", "value": <float>, "computation_trace_id": "<uuid>", "term": "long_term"},
+    ...
+  ],
+  "computation_traces": [...],
+  "metrics_selected": [...]
+}
+
+Rules:
+- Each horizon gets its own mu, sigma, and trace IDs.
+- Every metric in computed_metrics MUST include a "term" field indicating which
+  horizon it belongs to ("long_term", "medium_term", or "short_term").
+- Shared metrics (e.g. quality_score) can be duplicated with the same value but
+  different term values, or included once per horizon.
+- If only one horizon is requested, you may use the legacy flat format
+  (top-level mu, sigma, mu_trace_id, sigma_trace_id) instead.
 
 ════════════════════════════════════════════════════════════════════════
 RULES
 ════════════════════════════════════════════════════════════════════════
 
-  • Follow the computation plan exactly; do not skip any requested metric.
+  • Compute ALL applicable base metrics and ALL 255 combinations.
   • Every scalar result must have its own computation trace.
   • All rates are annualized decimals (0.12 = 12%, not 12 or "12%").
   • Handle missing data gracefully: if a required field is missing, use the
     fallback specified or the default value. Never crash on null data.
   • When parsing CSVs with pandas, use index_col=0 for statement data.
   • Count available quarters/years dynamically. Never assume 8 quarters.
-  • clip(x, lo, hi) = max(lo, min(hi, x))
 
 
 ## PHASE3_PROMPT
@@ -733,7 +558,7 @@ Your job:
    (value_interpretations). Cite metrics inline as
    [metric_name | trace:<computation_trace_id>].
 
-2. Synthesise the 3 valuation gaps (DCF, multiples, residual income) into a
+2. Synthesise the 255 empirical combination signals into a
    concise investment thesis. Explain which models suggest over-valuation
    vs under-valuation and by how much, and how they combine into the
    composite mu.

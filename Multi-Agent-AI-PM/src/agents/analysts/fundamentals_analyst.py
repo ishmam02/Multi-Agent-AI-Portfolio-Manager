@@ -18,7 +18,6 @@ from src.agents.prompts import load_prompt
 
 _fundamentals_prompts = load_prompt("fundamentals_analyst")
 HORIZON_FOCUS: dict[str, str] = _fundamentals_prompts["HORIZON_FOCUS"]  # type: ignore[assignment]
-PHASE1_PROMPT: str = _fundamentals_prompts["PHASE1_PROMPT"]  # type: ignore[assignment]
 PHASE2_PROMPT: str = _fundamentals_prompts["PHASE2_PROMPT"]  # type: ignore[assignment]
 PHASE3_PROMPT: str = _fundamentals_prompts["PHASE3_PROMPT"]  # type: ignore[assignment]
 
@@ -36,6 +35,12 @@ def gather_fundamental_data(ticker: str, trade_date: str, lookback_days: int) ->
         get_income_statement,
         get_insider_transactions,
         get_quarterly_history,
+    )
+    from src.dataflows.y_finance import (
+        get_analyst_recommendations,
+        get_growth_estimates,
+        get_macro_indicators,
+        get_sector_rotation,
     )
 
     data = {}
@@ -57,13 +62,45 @@ def gather_fundamental_data(ticker: str, trade_date: str, lookback_days: int) ->
     data["insider_transactions"] = get_insider_transactions.invoke({"ticker": ticker})
     data["earnings_dates"] = get_earnings_dates.invoke({"ticker": ticker})
     data["quarterly_history"] = get_quarterly_history.invoke({"ticker": ticker})
+
+    # ── Analyst recommendations for sentiment context ──
+    try:
+        data["analyst_recommendations"] = get_analyst_recommendations(symbol=ticker)
+    except Exception:
+        data["analyst_recommendations"] = ""
+
+    # ── Growth estimates for forward growth calibration ──
+    try:
+        data["growth_estimates"] = get_growth_estimates(symbol=ticker)
+    except Exception:
+        data["growth_estimates"] = ""
+
+    # ── Macro indicators for regime context ──
+    try:
+        data["macro_indicators"] = get_macro_indicators(curr_date=trade_date)
+    except Exception:
+        data["macro_indicators"] = ""
+
+    # ── Sector rotation for sector tailwind/headwind context ──
+    try:
+        data["sector_rotation"] = get_sector_rotation(
+            ticker=ticker, curr_date=trade_date
+        )
+    except Exception:
+        data["sector_rotation"] = ""
+
     return data
 
 
 # ── Node factory ─────────────────────────────────────────────────────────────
 
 
-def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="medium", active_horizons=("long_term",)):
+def create_fundamentals_analyst(
+    reasoning_llm,
+    code_agent,
+    research_depth="medium",
+    active_horizons=("long_term", "medium_term", "short_term"),
+):
     """Create a fundamentals analyst node for the outer AgentState graph.
 
     Parameters
@@ -77,7 +114,6 @@ def create_fundamentals_analyst(reasoning_llm, code_agent, research_depth="mediu
         "agent_type": AgentType.FUNDAMENTAL,
         "state_key": "fundamentals_report",
         "gather_fn": gather_fundamental_data,
-        "phase1_system_prompt": PHASE1_PROMPT,
         "phase2_system_prompt": PHASE2_PROMPT,
         "phase3_system_prompt": PHASE3_PROMPT,
         "horizon_focus": HORIZON_FOCUS,
@@ -209,13 +245,13 @@ if __name__ == "__main__":
     ).get_llm()
     ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=120,
+        max_iterations=8,
         analyst_type="fundamental",
         project_root=_project_root,
         verbose=False,
     )
-    node = create_fundamentals_analyst(llm, ca, "shallow", active_horizons=("long_term",))
-    result = node({"company_of_interest": "AAPL", "trade_date": "2025-03-14"})
+    node = create_fundamentals_analyst(llm, ca, "shallow")
+    result = node({"company_of_interest": "AAPL", "trade_date": "2026-03-14"})
     report = ResearchReport.model_validate_json(result.get("fundamentals_report", "{}"))
     print(report.model_dump_json(indent=2))

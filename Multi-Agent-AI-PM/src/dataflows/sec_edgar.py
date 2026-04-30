@@ -16,6 +16,12 @@ try:
 except ImportError as e:
     raise ImportError("edgartools is required for SEC EDGAR data. Install: pip install edgartools") from e
 
+# yfinance for macro / sector rotation data (edgartools does not provide these)
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None  # type: ignore
+
 
 def _ensure_identity():
     """SEC requires an identity (name + email) for rate-limiting."""
@@ -129,6 +135,28 @@ def _extract_statement(
             result = result[valid_cols]
         except Exception:
             pass
+
+    # ── Noise reduction ──
+    # Keep only the most recent 20 periods (avoids ultra-wide CSVs)
+    if len(result.columns) > 20:
+        result = result.iloc[:, -20:]
+
+    # Drop rows that are >70% NaN (often footnote variants or stale metrics)
+    result = result.dropna(thresh=len(result.columns) * 0.3)
+
+    # Deduplicate rows with nearly-identical names (e.g.
+    #   "Accounts receivable, less allowances of $104..."
+    #   "Accounts receivable, less allowances of $55...")
+    # Group by the first 3 lowercase words and keep the row with fewest NaNs.
+    if len(result) > 0:
+        def _clean_key(label: str) -> str:
+            words = str(label).lower().replace(",", "").split()
+            return " ".join(words[:3])
+
+        result["_dedup_key"] = result.index.map(_clean_key)
+        result["_na_count"] = result.isna().sum(axis=1)
+        result = result.sort_values("_na_count").drop_duplicates(subset="_dedup_key", keep="first")
+        result = result.drop(columns=["_dedup_key", "_na_count"])
 
     return result
 

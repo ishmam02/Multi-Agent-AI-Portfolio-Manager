@@ -10,6 +10,8 @@ from .y_finance import (
     get_earnings_dates as get_yfinance_earnings_dates,
     get_quarterly_history as get_yfinance_quarterly_history,
     get_insider_transactions as get_yfinance_insider_transactions,
+    get_macro_indicators as get_yfinance_macro_indicators,
+    get_sector_rotation as get_yfinance_sector_rotation,
 )
 from .yfinance_news import get_news_yfinance, get_global_news_yfinance
 from .alpaca import (
@@ -122,6 +124,12 @@ VENDOR_METHODS = {
     "get_insider_transactions": {
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
+    },
+    "get_macro_indicators": {
+        "yfinance": get_yfinance_macro_indicators,
+    },
+    "get_sector_rotation": {
+        "yfinance": get_yfinance_sector_rotation,
     },
 }
 

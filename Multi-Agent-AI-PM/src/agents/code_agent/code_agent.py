@@ -162,8 +162,8 @@ class CodeValidationAgent:
     def __init__(
         self,
         model: str,
-        timeout: int = 60,
-        max_iterations: int = 5,
+        timeout: int = 120,
+        max_iterations: int = 8,
         analyst_type: str = "fundamental",
         verbose: bool = False,
         project_root: str | None = None,
@@ -438,6 +438,8 @@ class CodeValidationAgent:
                 "import numpy as np\n"
                 "import pandas as pd\n"
                 "\n"
+                "np.random.seed(42)\n"
+                "\n"
                 f"{load_block}"
                 "\n"
                 "\n"
@@ -510,6 +512,22 @@ class CodeValidationAgent:
                 "    computed_metrics = [mu_metric, sigma_metric]\n"
                 "    computation_traces = [mu_trace, sigma_trace]\n"
                 "\n"
+                "    # metrics_selected: list every metric you computed with interpretation and rationale\n"
+                "    metrics_selected = [\n"
+                "        {\n"
+                '            "metric_name": "mu",\n'
+                '            "metric_interpretation": "Annualised expected return",\n'
+                '            "metric_rationale": "Primary directional signal",\n'
+                '            "computation_instruction": "See compute_mu function",\n'
+                "        },\n"
+                "        {\n"
+                '            "metric_name": "sigma",\n'
+                '            "metric_interpretation": "Annualised volatility",\n'
+                '            "metric_rationale": "Uncertainty in return estimate",\n'
+                '            "computation_instruction": "See compute_sigma function",\n'
+                "        },\n"
+                "    ]\n"
+                "\n"
                 "    result = {\n"
                 '        "mu": mu_val,\n'
                 '        "mu_trace_id": mu_trace["trace_id"],\n'
@@ -517,6 +535,7 @@ class CodeValidationAgent:
                 '        "sigma_trace_id": sigma_trace["trace_id"],\n'
                 '        "computed_metrics": computed_metrics,\n'
                 '        "computation_traces": computation_traces,\n'
+                '        "metrics_selected": metrics_selected,\n'
                 "    }\n"
                 "    print(json.dumps(result, indent=2))\n"
                 "\n"
@@ -573,13 +592,41 @@ class CodeValidationAgent:
                 f"=== COMPUTATION PLAN ({len(metrics_list)} metrics) ===\n"
                 f"{metrics_lines}\n"
             )
+            top_instruction = (
+                "Compute the financial metrics defined in the plan below.\n\n"
+            )
         else:
-            plan_section = (
-                f"=== COMPUTATION PLAN ===\n{json.dumps(computation_plan, indent=2)}\n"
+            # Plan-less mode: the code agent must analyse data, plan metrics, then code.
+            additional = computation_plan.get("additional_instructions", "")
+            revision = computation_plan.get("revision_count", 0)
+            plan_payload_str = json.dumps(computation_plan, indent=2)
+            plan_section = f"=== PLANNING CONTEXT ===\n{plan_payload_str}\n"
+            if additional:
+                plan_section += f"\n=== ADDITIONAL INSTRUCTIONS ===\n{additional}\n"
+            if revision > 0:
+                plan_section += (
+                    f"\n=== RETRY ATTEMPT {revision} ===\n"
+                    "Your previous code failed to execute or produced invalid output. "
+                    "SIMPLIFY your plan: use fewer metrics, simpler formulas, and "
+                    "avoid complex data parsing. Focus on the core signals only.\n"
+                )
+            top_instruction = (
+                "You are an autonomous quantitative analyst.\n"
+                "STEP 1 — QUICKLY SCAN the data files in your working directory. "
+                "Use a fast header check (e.g. `head -n 3` or Read the first few lines) "
+                "to see available columns and metric names. Do NOT read full data contents "
+                "or perform deep exploratory analysis. You only need headers and a handful of "
+                "rows to orient yourself.\n"
+                "STEP 2 — DECIDE which metrics to compute based on available columns. "
+                "Choose models and parameters that fit THIS specific stock, but do not use "
+                "a one-size-fits-all formula.\n"
+                "STEP 3 — IMMEDIATELY WRITE clean, vectorised Python code in metrics.py "
+                "that computes all chosen metrics, including mu and sigma.\n"
+                "STEP 4 — RUN `python3 metrics.py` and iterate until it exits 0 with valid JSON.\n\n"
             )
 
         return (
-            "Compute the financial metrics defined in the plan below.\n\n"
+            f"{top_instruction}"
             f"{plan_section}\n"
             f"{data_section}\n"
             "IMPLEMENT FIRST: immediately write the full metrics.py using Bash and "
@@ -594,7 +641,7 @@ class CodeValidationAgent:
     @staticmethod
     def _has_result_keys(d: Any) -> bool:
         """Return True if *d* looks like a metrics result dict."""
-        return isinstance(d, dict) and ("mu" in d or "computed_metrics" in d)
+        return isinstance(d, dict) and ("mu" in d or "computed_metrics" in d or "horizons" in d)
 
     @staticmethod
     def _extract_result_json(text: str) -> dict | None:
@@ -637,18 +684,23 @@ class CodeValidationAgent:
             except (json.JSONDecodeError, ValueError):
                 continue
 
-        # 3. Forward scan for { positions — keep last valid match.
+        # 3. Forward scan for { positions — keep the dict with the MOST keys.
         #    raw_decode respects JSON string quoting, so braces inside
         #    string values (e.g. full_code_trace.code) are skipped.
-        last_valid: dict | None = None
+        #    The outer result dict has 7+ keys; nested inner dicts (traces,
+        #    inputs, etc.) have fewer.  Picking the largest avoids extracting
+        #    a nested trace dict instead of the full result.
+        best_valid: dict | None = None
+        best_size = -1
         for m in re.finditer(r"\{", text):
             try:
                 d, _ = decoder.raw_decode(text, m.start())
-                if isinstance(d, dict) and _valid(d):
-                    last_valid = d
+                if isinstance(d, dict) and _valid(d) and len(d) > best_size:
+                    best_valid = d
+                    best_size = len(d)
             except (json.JSONDecodeError, ValueError):
                 continue
-        return last_valid
+        return best_valid
 
     # ── Result validation ─────────────────────────────────────────────────────
 
@@ -680,13 +732,30 @@ class CodeValidationAgent:
             for t in raw.get("computation_traces", [])
             if isinstance(t, dict)
         ]
+        # Extract metrics_selected (the plan the code agent created)
+        metrics_selected: list[dict] = []
+        for m in raw.get("metrics_selected", []):
+            if isinstance(m, dict) and "metric_name" in m:
+                metrics_selected.append(
+                    {
+                        "metric_name": str(m["metric_name"]),
+                        "metric_interpretation": str(m.get("metric_interpretation", "")),
+                        "metric_rationale": str(m.get("metric_rationale", "")),
+                        "computation_instruction": str(m.get("computation_instruction", "")),
+                    }
+                )
+        # Support multi-horizon output: pass through "horizons" dict if present
         result: dict[str, Any] = {
-            "mu": self._safe_float(raw.get("mu"), 0.0),
-            "sigma": max(self._safe_float(raw.get("sigma"), 0.01), 1e-6),
             "computed_metrics": metrics,
             "computation_traces": traces,
+            "metrics_selected": metrics_selected,
             "code_succeeded": True,
         }
+        if "horizons" in raw and isinstance(raw["horizons"], dict):
+            result["horizons"] = raw["horizons"]
+        else:
+            result["mu"] = self._safe_float(raw.get("mu"), 0.0)
+            result["sigma"] = max(self._safe_float(raw.get("sigma", 0.01)), 1e-6)
         if "mu_trace_id" in raw:
             result["mu_trace_id"] = str(raw["mu_trace_id"])
         if "sigma_trace_id" in raw:
@@ -706,6 +775,7 @@ class CodeValidationAgent:
                     "output": f"FAILED: {reason}",
                 }
             ],
+            "metrics_selected": [],
             "code_succeeded": False,
         }
 
@@ -767,14 +837,25 @@ class CodeValidationAgent:
         """
         ticker = computation_plan.get("ticker", "UNKNOWN")
         analysis_date = computation_plan.get("analysis_date", "unknown")
-        horizon = computation_plan.get("horizon", "unknown")
+        active_horizons = computation_plan.get("active_horizons", [])
+        horizon = computation_plan.get("horizon")
+        if horizon is None:
+            if isinstance(active_horizons, (list, tuple)) and len(active_horizons) == 1:
+                horizon = active_horizons[0]
+            else:
+                horizon = "unknown"
+        # Use "multi" when multiple horizons are computed in one pass
+        if isinstance(active_horizons, (list, tuple)) and len(active_horizons) > 1:
+            work_dir_horizon = "multi"
+        else:
+            work_dir_horizon = horizon
         work_dir = os.path.join(
             self._project_root,
             "results",
             ticker,
             analysis_date,
             self.analyst_type,
-            horizon,
+            work_dir_horizon,
         )
         os.makedirs(work_dir, exist_ok=True)
         self._current_work_dir = work_dir
@@ -788,11 +869,25 @@ class CodeValidationAgent:
         script_path, data_files = self._scaffold_metrics_file(work_dir, data)
         self._log("SCAFFOLD", f"Created {script_path} + sidecar data files")
 
+        # ── Off-load long domain prompts to a file so the system prompt stays short.
+        #    The agent reads the file on its first turn; after that every turn
+        #    processes only the short system prompt.
+        short_domain: str | None = domain_prompt
+        if domain_prompt and len(domain_prompt) > 2000:
+            instructions_path = os.path.join(work_dir, "instructions.txt")
+            with open(instructions_path, "w", encoding="utf-8") as fh:
+                fh.write(domain_prompt)
+            short_domain = (
+                f"You are a quantitative {self.analyst_type} analyst. "
+                f"Read {instructions_path} for detailed methodology before coding."
+            )
+            self._log("PROMPT", f"Off-loaded long domain prompt to {instructions_path}")
+
         # ── Gather context the agent would normally spend turns discovering ──
         dir_listing = "\n".join(f"  {f}" for f in sorted(os.listdir(work_dir)))
 
-        # Build comprehensive data preview for ALL CSV files so the agent
-        # never needs to waste turns reading files it already has.
+        # Build concise data preview for CSV files: headers / metric names ONLY.
+        # No actual data values are sent — the agent can Read the file if it needs them.
         data_preview = ""
         for fname in sorted(data_files):
             if not fname.endswith(".csv") or fname == "metrics.py":
@@ -804,78 +899,115 @@ class CodeValidationAgent:
             except Exception:
                 continue
 
-            # Financial statements: show all rows (typically < 80) so the agent
-            # has exact metric names and values without reading files.
-            if CodeValidationAgent._is_financial_statement_csv(text):
-                lines = text.splitlines()
-                data_preview += (
-                    f"\n=== FULL CONTENTS OF {fname} ===\n"
-                    + "\n".join(lines[:80])  # cap at 80 rows
-                )
-                if len(lines) > 80:
-                    data_preview += f"\n... ({len(lines) - 80} more rows) ...\n"
-                data_preview += "\n"
+            lines = text.splitlines()
+            if not lines:
                 continue
 
-            # Non-financial CSVs: show first 12 rows
-            lines = text.splitlines()
-            if len(lines) <= 12:
-                data_preview += (
-                    f"\n=== FULL CONTENTS OF {fname} ===\n" + text.rstrip() + "\n\n"
-                )
-            else:
-                data_preview += (
-                    f"\n=== HEAD OF {fname} (first 12 rows) ===\n"
-                    + "\n".join(lines[:12])
-                    + f"\n... ({len(lines) - 12} more rows) ...\n\n"
-                )
+            # Every CSV: show the header row (column names).
+            data_preview += f"\n=== {fname} HEADER ===\n{lines[0]}\n"
 
-        with open(script_path, encoding="utf-8") as fh:
-            scaffold_src = fh.read()
+            # Financial-statement CSVs: also list the metric names (first column of
+            # each data row) so the agent knows what metrics are available.
+            if CodeValidationAgent._is_financial_statement_csv(text):
+                metrics = []
+                for line in lines[1:]:
+                    if not line.strip():
+                        continue
+                    first_col = line.split(",")[0].strip()
+                    if first_col:
+                        metrics.append(first_col)
+                if metrics:
+                    data_preview += f"METRICS: {', '.join(metrics)}\n"
+
+        # Add instructions.txt reference if it was off-loaded
+        instructions_ref = ""
+        instructions_path = os.path.join(work_dir, "instructions.txt")
+        if os.path.isfile(instructions_path):
+            instructions_ref = (
+                f"\n=== METHODOLOGY ===\n"
+                f"Read {instructions_path} for the full computation methodology "
+                "(formulas, metrics, output format) before writing any code.\n"
+            )
 
         prompt = (
             self._build_user_prompt(computation_plan, data, data_files=data_files)
             + f"\n\n=== WORKING DIRECTORY: {work_dir} ===\n{dir_listing}"
             + data_preview
-            + f"\n\n=== CURRENT {script_path} (scaffold) ===\n{scaffold_src}"
-            + f"\n\nIMPORTANT: All files above already exist in {work_dir}. "
-            "Do NOT run ls, cat, head, or tail — data file contents are shown above. "
-            "Do NOT Read any data CSVs, JSONs, or TXTs — their full contents are in this prompt. "
-            "You may only Read metrics.py when debugging. "
-            "Start coding immediately. "
-            f"Immediately overwrite {script_path} with the full implementation using a "
-            f"heredoc (`cat > {script_path} << 'PYEOF' ... PYEOF`) and run it with "
-            f"`python3 {script_path}`.\n"
-            "The scaffold already defines these helpers (keep them exactly as-is):\n"
-            "  • `build_computation_trace(func, inputs, output)` — captures the "
-            "function source and returns a trace dict with a trace_id.\n"
-            "  • `build_computed_metric(metric_name, value, trace)` — returns a "
-            "computed metric dict linked to the trace.\n\n"
-            "It also loads the primary data as `df`.  Your implementation must:\n"
-            "  1. Keep `build_computation_trace` and `build_computed_metric` exactly as-is.\n"
-            "  2. Replace `compute_mu` and `compute_sigma` with real implementations.\n"
-            "  3. Add one function per additional metric requested in the plan.\n"
-            "  4. In `main()`, for EVERY metric (including mu and sigma):\n"
+            + instructions_ref
+            + f"\n\n=== SCAFFOLD FILE ===\n"
+            f"{script_path} already exists with `build_computation_trace`, "
+            f"`build_computed_metric`, and `compute_mu` / `compute_sigma` stubs. "
+            f"Read it first, then overwrite it with your full implementation.\n"
+            + f"\nIMPORTANT: Start immediately. Read {script_path} first, then overwrite "
+            f"it with a heredoc (`cat > {script_path} << 'PYEOF' ... PYEOF`) and run "
+            f"it with `python3 {script_path}`.\n"
+            "Keep these helpers exactly as-is:\n"
+            "  • `build_computation_trace(func, inputs, output)`\n"
+            "  • `build_computed_metric(metric_name, value, trace)`\n\n"
+            "Your implementation must:\n"
+            "  1. Replace `compute_mu` and `compute_sigma` with real implementations.\n"
+            "     For multi-horizon runs, use per-horizon names like `compute_mu_long_term`,\n"
+            "     `compute_sigma_long_term`, `compute_mu_medium_term`, etc.\n"
+            "  2. Add one function per additional metric requested in the plan.\n"
+            "  3. CRITICAL: `computed_metrics` MUST contain an entry for EVERY metric "
+            "you compute, INCLUDING mu and sigma. Do NOT omit them.\n"
+            "     In `main()`, for EVERY metric (including mu and sigma):\n"
             "       a. Call the metric function to get its value.\n"
             "       b. Build its trace: `trace = build_computation_trace(func, inputs, value)`\n"
             "       c. Build its metric: `metric = build_computed_metric(name, value, trace)`\n"
             "       d. Append trace to `computation_traces` and metric to `computed_metrics`.\n"
-            "  5. Print the final result using EXACTLY this structure:\n"
-            "       result = {\n"
-            '           "mu": mu_val,\n'
-            '           "mu_trace_id": mu_trace["trace_id"],\n'
-            '           "sigma": sigma_val,\n'
-            '           "sigma_trace_id": sigma_trace["trace_id"],\n'
-            '           "computed_metrics": computed_metrics,\n'
-            '           "computation_traces": computation_traces,\n'
-            "       }\n"
-            "       print(json.dumps(result, indent=2))\n"
-            "  6. Nothing else should be printed to stdout.\n"
+        )
+
+        # Dynamically insert the correct output format based on active_horizons
+        if isinstance(active_horizons, (list, tuple)) and len(active_horizons) > 1:
+            prompt += (
+                "  5. Print the final result using the MULTI-HORIZON format:\n"
+                '       result = {\n'
+                '           "horizons": {\n'
+            )
+            for h in active_horizons:
+                prompt += (
+                    f'               "{h}": {{\n'
+                    f'                   "mu": <float>,\n'
+                    f'                   "mu_trace_id": "<uuid4>",\n'
+                    f'                   "sigma": <float>,\n'
+                    f'                   "sigma_trace_id": "<uuid4>"\n'
+                    f'               }},\n'
+                )
+            prompt += (
+                '           },\n'
+                '           "computed_metrics": computed_metrics,   # each entry MUST include "term": "long_term" etc.\n'
+                '           "computation_traces": computation_traces,\n'
+                '           "metrics_selected": metrics_selected,\n'
+                "       }\n"
+                "       print(json.dumps(result, indent=2))\n"
+            )
+        else:
+            h = active_horizons[0] if isinstance(active_horizons, (list, tuple)) and len(active_horizons) == 1 else "long_term"
+            prompt += (
+                "  5. Print the final result using the SINGLE-HORIZON format:\n"
+                "       result = {\n"
+                '           "mu": mu_val,\n'
+                '           "mu_trace_id": mu_trace["trace_id"],\n'
+                '           "sigma": sigma_val,\n'
+                '           "sigma_trace_id": sigma_trace["trace_id"],\n'
+                '           "computed_metrics": computed_metrics,\n'
+                '           "computation_traces": computation_traces,\n'
+                '           "metrics_selected": metrics_selected,\n'
+                "       }\n"
+                "       print(json.dumps(result, indent=2))\n"
+            )
+
+        prompt += (
+            "  6. BEFORE declaring success, verify that `computed_metrics` contains "
+            "entries for `mu` and `sigma` (and any other metrics you computed).\n"
+            "     If they are missing, add them — do NOT return an empty computed_metrics list.\n"
+            "  7. Nothing else should be printed to stdout.\n"
             f"ALL file paths MUST be absolute under {work_dir}.\n"
             f"Iterate with Bash until `python3 {script_path}` exits 0 with no errors."
         )
 
-        system_prompt = self._build_system_prompt(domain_prompt, work_dir=work_dir)
+        system_prompt = self._build_system_prompt(short_domain, work_dir=work_dir)
         self._log_block("SYSTEM PROMPT", system_prompt)
         self._log_block("USER PROMPT", prompt)
 
@@ -952,7 +1084,7 @@ class CodeValidationAgent:
         # long, assume it is hung and kill it.  This guards against the
         # blocking-readline problem where proc.wait(timeout=...) is never
         # reached because the for-loop on stdout never exits.
-        line_idle_timeout = self.timeout * 5  # e.g. 60s × 5 = 300s per line
+        line_idle_timeout = self.timeout * 4  # e.g. 120s × 4 = 480s per line
 
         for attempt in range(1, max_retries + 2):  # 1..max_retries+1
             t_start = time.monotonic()
@@ -1021,12 +1153,20 @@ class CodeValidationAgent:
                             evt_type = evt.get("type", "")
                             if evt_type == "result":
                                 result_text = evt.get("result", "")
+                                stop_reason = evt.get("stop_reason", "")
+                                is_error = evt.get("is_error", False)
                                 self._log(
                                     "RESULT",
-                                    f"is_error={evt.get('is_error')}  "
-                                    f"stop_reason={evt.get('stop_reason')}  "
+                                    f"is_error={is_error}  "
+                                    f"stop_reason={stop_reason}  "
                                     f"turns={evt.get('num_turns')}",
                                 )
+                                # If the assistant finished normally there is no
+                                # reason to keep the subprocess alive — it may idle
+                                # for minutes before closing stdout. Break immediately
+                                # and let proc.wait(timeout=30) clean up.
+                                if stop_reason == "end_turn" and not is_error:
+                                    break
                             elif evt_type in ("system", "user"):
                                 self._log(
                                     f"EVT:{evt_type}",
@@ -1198,259 +1338,3 @@ class CodeValidationAgent:
             f"All extraction tiers failed. "
             f"metrics.py rc={rc}, stderr: {stderr}, stdout: {stdout}"
         )
-
-
-# ── Quick smoke test ──────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import pathlib
-    import sys as _sys
-
-    # Ensure the Multi-Agent-AI-PM directory is on sys.path so that
-    # `src.*` imports resolve regardless of how this file is invoked.
-    _repo_root = str(pathlib.Path(__file__).resolve().parents[3])
-    if _repo_root not in _sys.path:
-        _sys.path.insert(0, _repo_root)
-
-    from src.agents.utils.core_stock_tools import get_stock_data
-
-    # 1. Fetch AAPL OHLCV data for last year
-    print("Fetching AAPL stock data for 2025 ...")
-    raw_data = get_stock_data.invoke(
-        {
-            "symbol": "AAPL",
-            "start_date": "2025-01-01",
-            "end_date": "2026-03-30",
-        }
-    )
-    print("Data fetched. Preview (first 400 chars):")
-    print(str(raw_data)[:400])
-    print()
-
-    # 2. Quantitative market analyst computation plan (List[Metrics] format)
-    computation_plan = {
-        "ticker": "AAPL",
-        "analysis_date": "2025-12-31",
-        "horizon": "short_term",
-        "analyst_type": "market",
-        "computation_plan": [
-            # ── Trend ────────────────────────────────────────────────────────
-            {
-                "metric_name": "EMA_20",
-                "metric_interpretation": "20-period exponential moving average of Close; short-term trend baseline.",
-                "metric_rationale": "Captures near-term price momentum and acts as dynamic support/resistance.",
-                "computation_instruction": "df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean(); return float(df['EMA_20'].iloc[-1])",
-            },
-            {
-                "metric_name": "EMA_50",
-                "metric_interpretation": "50-period EMA of Close; intermediate-term trend baseline.",
-                "metric_rationale": "Key medium-term trend filter used in regime classification.",
-                "computation_instruction": "df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean(); return float(df['EMA_50'].iloc[-1])",
-            },
-            {
-                "metric_name": "EMA_200",
-                "metric_interpretation": "200-period EMA of Close; long-term trend baseline.",
-                "metric_rationale": "Widely-watched level that separates bull/bear market regimes.",
-                "computation_instruction": "df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean(); return float(df['EMA_200'].iloc[-1])",
-            },
-            {
-                "metric_name": "ADX_14",
-                "metric_interpretation": "14-period Average Directional Index; measures trend strength (0–100), not direction.",
-                "metric_rationale": "Distinguishes trending from ranging markets; required for regime classification.",
-                "computation_instruction": (
-                    "Compute +DM = max(High-prev_High, 0), -DM = max(prev_Low-Low, 0) (zero if +DM > -DM for -DM and vice versa). "
-                    "TR = max(High-Low, abs(High-prev_Close), abs(Low-prev_Close)). "
-                    "Smooth all three with 14-period Wilder's EMA (ATR-style). "
-                    "+DI = 100*smooth_+DM/ATR14, -DI = 100*smooth_-DM/ATR14. "
-                    "DX = 100*abs(+DI - -DI)/(+DI + -DI). ADX = 14-period Wilder's EMA of DX. "
-                    "Return {'ADX_14': float(adx[-1]), 'ADX_plus_DI': float(plus_di[-1]), 'ADX_minus_DI': float(minus_di[-1])}"
-                ),
-            },
-            {
-                "metric_name": "price_vs_EMA50_pct",
-                "metric_interpretation": "Percentage deviation of last Close from EMA_50; positive = above trend.",
-                "metric_rationale": "Quantifies how extended price is relative to the intermediate trend.",
-                "computation_instruction": "return (df['Close'].iloc[-1] / ema_50[-1] - 1) * 100",
-            },
-            {
-                "metric_name": "price_vs_EMA200_pct",
-                "metric_interpretation": "Percentage deviation of last Close from EMA_200; positive = above long-term trend.",
-                "metric_rationale": "Measures long-term overextension or undervaluation vs. the 200-EMA.",
-                "computation_instruction": "return (df['Close'].iloc[-1] / ema_200[-1] - 1) * 100",
-            },
-            # ── Momentum ─────────────────────────────────────────────────────
-            {
-                "metric_name": "RSI_14",
-                "metric_interpretation": "Wilder's 14-period Relative Strength Index [0,100]; >70 overbought, <30 oversold.",
-                "metric_rationale": "Primary momentum oscillator; feeds into composite signal scoring for mu.",
-                "computation_instruction": (
-                    "delta = df['Close'].diff(). "
-                    "gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean(). "
-                    "loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean(). "
-                    "RS = gain / loss.replace(0, 1e-9). return float(100 - 100/(1+RS.iloc[-1]))"
-                ),
-            },
-            {
-                "metric_name": "MACD_line",
-                "metric_interpretation": "MACD line = EMA(12) - EMA(26) of Close; positive = short-term momentum above medium.",
-                "metric_rationale": "Trend-following momentum indicator; histogram sign feeds into composite scoring.",
-                "computation_instruction": (
-                    "ema12 = df['Close'].ewm(span=12, adjust=False).mean(). "
-                    "ema26 = df['Close'].ewm(span=26, adjust=False).mean(). "
-                    "macd = ema12 - ema26. signal = macd.ewm(span=9, adjust=False).mean(). "
-                    "histogram = macd - signal. "
-                    "return {'MACD_line': float(macd.iloc[-1]), 'MACD_signal': float(signal.iloc[-1]), 'MACD_histogram': float(histogram.iloc[-1])}"
-                ),
-            },
-            {
-                "metric_name": "stochastic_K",
-                "metric_interpretation": "14-period Stochastic %K [0,100] = 100*(C-L14)/(H14-L14); >80 overbought, <20 oversold.",
-                "metric_rationale": "Identifies overbought/oversold levels within the current trading range.",
-                "computation_instruction": (
-                    "L14 = df['Low'].rolling(14).min(). H14 = df['High'].rolling(14).max(). "
-                    "K = 100*(df['Close']-L14)/(H14-L14+1e-9). D = K.rolling(3).mean(). "
-                    "return {'stochastic_K': float(K.iloc[-1]), 'stochastic_D': float(D.iloc[-1])}"
-                ),
-            },
-            {
-                "metric_name": "ROC_10",
-                "metric_interpretation": "10-period Rate of Change = (Close[-1]/Close[-11]-1)*100; percent price change over 10 bars.",
-                "metric_rationale": "Short-term price momentum proxy; confirms or diverges from RSI signal.",
-                "computation_instruction": "return float((df['Close'].iloc[-1] / df['Close'].iloc[-11] - 1) * 100)",
-            },
-            # ── Volatility ───────────────────────────────────────────────────
-            {
-                "metric_name": "BB_upper",
-                "metric_interpretation": "Bollinger Band upper = 20-SMA + 2*20-day std(Close); dynamic resistance level.",
-                "metric_rationale": "Price touching upper band signals overbought condition or strong breakout.",
-                "computation_instruction": (
-                    "sma20 = df['Close'].rolling(20).mean(). std20 = df['Close'].rolling(20).std(). "
-                    "upper = sma20 + 2*std20. lower = sma20 - 2*std20. "
-                    "width = (upper-lower)/sma20. pct_b = (df['Close']-lower)/(upper-lower+1e-9). "
-                    "return {'BB_upper': float(upper.iloc[-1]), 'BB_lower': float(lower.iloc[-1]), "
-                    "'BB_width': float(width.iloc[-1]), 'BB_pct_B': float(pct_b.iloc[-1])}"
-                ),
-            },
-            {
-                "metric_name": "ATR_14",
-                "metric_interpretation": "14-period Average True Range; absolute daily volatility in price units.",
-                "metric_rationale": "Used for position sizing and stop-loss placement; reflects current risk per bar.",
-                "computation_instruction": (
-                    "tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), "
-                    "(df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1). "
-                    "return float(tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1])"
-                ),
-            },
-            {
-                "metric_name": "HV_20",
-                "metric_interpretation": "20-day close-to-close historical volatility, annualised (decimal); e.g. 0.25 = 25% p.a.",
-                "metric_rationale": "Baseline realised volatility; feeds into sigma and volatility regime classification.",
-                "computation_instruction": (
-                    "log_ret = np.log(df['Close']/df['Close'].shift(1)).dropna(). "
-                    "return float(log_ret.rolling(20).std().iloc[-1] * np.sqrt(252))"
-                ),
-            },
-            {
-                "metric_name": "garman_klass_vol",
-                "metric_interpretation": "Garman-Klass OHLC volatility estimator, annualised; more efficient than close-to-close.",
-                "metric_rationale": "Lower-variance vol estimator used as sigma for the output; floor at 0.01.",
-                "computation_instruction": (
-                    "u = np.log(df['High']/df['Open']). d = np.log(df['Low']/df['Open']). "
-                    "c = np.log(df['Close']/df['Open']). "
-                    "gk = (0.5*u**2 - (2*np.log(2)-1)*c**2). "
-                    "return float(max(np.sqrt(gk.mean()*252), 0.01))"
-                ),
-            },
-            # ── Volume ───────────────────────────────────────────────────────
-            {
-                "metric_name": "OBV",
-                "metric_interpretation": "On-Balance Volume; cumulative volume signed by daily price direction.",
-                "metric_rationale": "Detects volume-price divergence and accumulation/distribution pressure.",
-                "computation_instruction": (
-                    "direction = np.sign(df['Close'].diff().fillna(0)). "
-                    "obv = (direction * df['Volume']).cumsum(). "
-                    "return float(obv.iloc[-1])"
-                ),
-            },
-            {
-                "metric_name": "CMF_20",
-                "metric_interpretation": "20-period Chaikin Money Flow [-1,+1]; positive = buying pressure dominates.",
-                "metric_rationale": "Confirms OBV signal; both required for volume_regime classification.",
-                "computation_instruction": (
-                    "mfv = ((df['Close']-df['Low'])-(df['High']-df['Close']))/(df['High']-df['Low']+1e-9)*df['Volume']. "
-                    "return float(mfv.rolling(20).sum() / df['Volume'].rolling(20).sum().replace(0,1e-9)).iloc[-1]"
-                ),
-            },
-            # ── Regime classification ─────────────────────────────────────────
-            {
-                "metric_name": "trend_regime",
-                "metric_interpretation": "Categorical trend state: 'strong_uptrend'|'weak_uptrend'|'ranging'|'weak_downtrend'|'strong_downtrend'.",
-                "metric_rationale": "Feeds into composite signal score for mu calculation.",
-                "computation_instruction": (
-                    "adx_val, plus_di, minus_di = ADX_14, ADX_plus_DI, ADX_minus_DI (last values). "
-                    "close = df['Close'].iloc[-1]. "
-                    "if adx_val > 25 and plus_di > minus_di and close > ema50 and close > ema200: return 'strong_uptrend'. "
-                    "elif 20 <= adx_val <= 25 and plus_di > minus_di and close > ema50: return 'weak_uptrend'. "
-                    "elif adx_val < 20: return 'ranging'. "
-                    "elif 20 <= adx_val <= 25 and minus_di > plus_di and close < ema50: return 'weak_downtrend'. "
-                    "else: return 'strong_downtrend'"
-                ),
-            },
-            {
-                "metric_name": "volatility_regime",
-                "metric_interpretation": "Categorical volatility state: 'low_vol'|'normal_vol'|'high_vol' based on HV_20 tercile.",
-                "metric_rationale": "Contextualises current volatility relative to its own 252-day history.",
-                "computation_instruction": (
-                    "hv_series = log_ret.rolling(20).std() * np.sqrt(252). "
-                    "t33, t67 = hv_series.rolling(252).quantile(0.33).iloc[-1], hv_series.rolling(252).quantile(0.67).iloc[-1]. "
-                    "hv_now = hv_series.iloc[-1]. "
-                    "return 'low_vol' if hv_now < t33 else ('high_vol' if hv_now > t67 else 'normal_vol')"
-                ),
-            },
-            {
-                "metric_name": "volume_regime",
-                "metric_interpretation": "Categorical volume pressure: 'accumulation'|'distribution'|'neutral'.",
-                "metric_rationale": "Volume confirmation for trend signals; feeds into composite score for mu.",
-                "computation_instruction": (
-                    "obv_slope = np.polyfit(range(20), obv_series.iloc[-20:].values, 1)[0]. "
-                    "cmf_val = CMF_20 (last value). "
-                    "if obv_slope > 0 and cmf_val > 0.05: return 'accumulation'. "
-                    "elif obv_slope < 0 and cmf_val < -0.05: return 'distribution'. "
-                    "else: return 'neutral'"
-                ),
-            },
-            # ── mu / sigma ────────────────────────────────────────────────────
-            {
-                "metric_name": "mu",
-                "metric_interpretation": "Annualised expected return derived from composite signal score; range [-0.40, +0.40].",
-                "metric_rationale": "Primary output: signal-weighted return estimate for the short-term horizon.",
-                "computation_instruction": (
-                    "trend_score = +1 if trend_regime in ('strong_uptrend','weak_uptrend') else (-1 if 'downtrend' in trend_regime else 0). "
-                    "mom_score = +1 if (50 < rsi <= 70 and macd_hist > 0) else (-1 if (30 <= rsi < 50 and macd_hist < 0) else 0). "
-                    "vol_score = +1 if volume_regime=='accumulation' else (-1 if volume_regime=='distribution' else 0). "
-                    "composite = trend_score + mom_score + vol_score. "
-                    "return composite / 3 * 0.40"
-                ),
-            },
-            {
-                "metric_name": "sigma",
-                "metric_interpretation": "Annualised volatility contribution; equals garman_klass_vol, floored at 0.01.",
-                "metric_rationale": "Represents the uncertainty/risk dimension of the return estimate.",
-                "computation_instruction": "return max(garman_klass_vol, 0.01)",
-            },
-        ],
-    }
-
-    # 3. Run the CodeValidationAgent against a local Ollama endpoint
-    agent = CodeValidationAgent(
-        model="minimax-m2.7:cloud",
-        analyst_type="market",
-        verbose=True,
-    )
-
-    print("Running CodeValidationAgent ...")
-    result = agent.execute_plan(computation_plan, {"stock_data": raw_data})
-
-    # 4. Print the result
-    print("\n=== CodeValidationAgent Result ===")
-    print(json.dumps(result, indent=2))

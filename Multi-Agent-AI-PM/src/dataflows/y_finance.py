@@ -1,5 +1,6 @@
 from typing import Annotated
 from datetime import datetime
+import pandas as pd
 import yfinance as yf
 
 def get_YFin_data_online(
@@ -347,3 +348,147 @@ def get_growth_estimates(symbol: Annotated[str, "ticker symbol of the company"])
         return growth.reset_index().to_dict(orient="records")
     except Exception as e:
         return f"Error getting growth estimates for {symbol}: {str(e)}"
+
+
+# ── Macro indicators ────────────────────────────────────────────────────────
+
+_SECTOR_ETF_MAP = {
+    "technology": "XLK",
+    "healthcare": "XLV",
+    "financials": "XLF",
+    "financial services": "XLF",
+    "consumer cyclical": "XLY",
+    "consumer defensive": "XLP",
+    "industrials": "XLI",
+    "energy": "XLE",
+    "basic materials": "XLB",
+    "utilities": "XLU",
+    "real estate": "XLRE",
+    "communication services": "XLC",
+}
+
+
+def _momentum_pct(history: pd.DataFrame, days: int = 63) -> float | None:
+    """Compute price momentum over *days* trading days from yfinance history."""
+    if history.empty or len(history) < days + 1:
+        return None
+    latest = history["Close"].iloc[-1]
+    past = history["Close"].iloc[-(days + 1)]
+    if pd.isna(latest) or pd.isna(past) or past == 0:
+        return None
+    return float((latest - past) / past)
+
+
+def get_macro_indicators(
+    curr_date: Annotated[str, "current date for backtest filtering (yyyy-mm-dd)"] = None
+):
+    """Get broad macro indicators: VIX, SPY 6-month momentum, 10y/3m yields, yield spread.
+
+    Returns a CSV string with headers: Indicator, Value.
+    """
+    try:
+        rows: list[dict] = []
+
+        # VIX
+        vix = yf.Ticker("^VIX").history(period="5d")
+        if not vix.empty:
+            rows.append({"Indicator": "VIX", "Value": round(float(vix["Close"].iloc[-1]), 2)})
+
+        # SPY 6-month (~126 trading days) momentum
+        spy_hist = yf.Ticker("SPY").history(period="9mo")
+        spy_6m = _momentum_pct(spy_hist, days=126)
+        if spy_6m is not None:
+            rows.append({"Indicator": "SPY_6m_momentum", "Value": round(spy_6m, 4)})
+
+        # 10-year yield (^TNX is in percent points, e.g. 4.25)
+        tnx = yf.Ticker("^TNX").history(period="5d")
+        if not tnx.empty:
+            # ^TNX is quoted as a percent (e.g. 4.25 = 4.25%). Convert to decimal.
+            tnx_val = float(tnx["Close"].iloc[-1]) / 100.0
+            rows.append({"Indicator": "10y_yield", "Value": round(tnx_val, 4)})
+
+        # 3-month yield (^IRX)
+        irx = yf.Ticker("^IRX").history(period="5d")
+        if not irx.empty:
+            irx_val = float(irx["Close"].iloc[-1]) / 100.0
+            rows.append({"Indicator": "3m_yield", "Value": round(irx_val, 4)})
+
+        # Yield spread = 10y - 3m
+        if len(rows) >= 2:
+            tnx_row = next((r for r in rows if r["Indicator"] == "10y_yield"), None)
+            irx_row = next((r for r in rows if r["Indicator"] == "3m_yield"), None)
+            if tnx_row and irx_row:
+                rows.append(
+                    {
+                        "Indicator": "yield_spread",
+                        "Value": round(tnx_row["Value"] - irx_row["Value"], 4),
+                    }
+                )
+
+        if not rows:
+            return "No macro indicator data available"
+
+        df = pd.DataFrame(rows)
+        return df.to_csv(index=False)
+
+    except Exception as e:
+        return f"Error retrieving macro indicators: {str(e)}"
+
+
+def get_sector_rotation(
+    ticker: Annotated[str, "ticker symbol of the company"],
+    curr_date: Annotated[str, "current date for backtest filtering (yyyy-mm-dd)"] = None,
+):
+    """Get sector ETF 3-month momentum vs SPY for the stock's sector.
+
+    Returns a CSV string with headers: Indicator, Value.
+    """
+    try:
+        rows: list[dict] = []
+
+        # Resolve sector ETF
+        info = yf.Ticker(ticker.upper()).info
+        sector = (info.get("sector") or "").lower().strip()
+        sector_etf = _SECTOR_ETF_MAP.get(sector)
+
+        if sector_etf:
+            # 3-month (~63 trading days) momentum
+            sector_hist = yf.Ticker(sector_etf).history(period="6mo")
+            sector_3m = _momentum_pct(sector_hist, days=63)
+            if sector_3m is not None:
+                rows.append(
+                    {
+                        "Indicator": f"{sector_etf}_3m_momentum",
+                        "Value": round(sector_3m, 4),
+                    }
+                )
+
+        # SPY 3-month momentum
+        spy_hist = yf.Ticker("SPY").history(period="6mo")
+        spy_3m = _momentum_pct(spy_hist, days=63)
+        if spy_3m is not None:
+            rows.append({"Indicator": "SPY_3m_momentum", "Value": round(spy_3m, 4)})
+
+        # Sector vs SPY spread
+        if len(rows) >= 2:
+            sector_row = next(
+                (r for r in rows if r["Indicator"].endswith("_3m_momentum") and r["Indicator"] != "SPY_3m_momentum"),
+                None,
+            )
+            spy_row = next((r for r in rows if r["Indicator"] == "SPY_3m_momentum"), None)
+            if sector_row and spy_row:
+                rows.append(
+                    {
+                        "Indicator": "sector_vs_SPY_spread",
+                        "Value": round(sector_row["Value"] - spy_row["Value"], 4),
+                    }
+                )
+
+        if not rows:
+            return "No sector rotation data available"
+
+        df = pd.DataFrame(rows)
+        return df.to_csv(index=False)
+
+    except Exception as e:
+        return f"Error retrieving sector rotation for {ticker}: {str(e)}"

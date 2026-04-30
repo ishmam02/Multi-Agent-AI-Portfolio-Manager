@@ -21,7 +21,6 @@ from src.llm_clients import create_llm_client
 
 _market_prompts = load_prompt("market_analyst")
 HORIZON_FOCUS: dict[str, str] = _market_prompts["HORIZON_FOCUS"]  # type: ignore[assignment]
-PHASE1_PROMPT: str = _market_prompts["PHASE1_PROMPT"]  # type: ignore[assignment]
 PHASE2_PROMPT: str = _market_prompts["PHASE2_PROMPT"]  # type: ignore[assignment]
 PHASE3_PROMPT: str = _market_prompts["PHASE3_PROMPT"]  # type: ignore[assignment]
 
@@ -30,13 +29,20 @@ PHASE3_PROMPT: str = _market_prompts["PHASE3_PROMPT"]  # type: ignore[assignment
 
 
 def gather_technical_data(ticker: str, trade_date: str, lookback_days: int) -> dict:
-    """Fetch OHLCV data and a comprehensive set of technical indicators.
+    """Fetch OHLCV data, macro indicators, sector context, and fundamentals.
 
-    Ensures at least 252 trading days of history are fetched so that
-    long-period indicators (200-day SMA) are computable even for short-term
-    horizons (which only require 30 days of lookback for the k-NN analysis).
+    Rich data enables stock-specific parameter calibration in Phase 1 and
+    contextual interpretation in Phase 3.  Different stocks have different
+    profiles (growth vs dividend, high-beta vs defensive, earnings schedule)
+    and the analysis must adapt accordingly.
     """
     from src.agents.utils.agent_utils import get_stock_data
+    from src.dataflows.y_finance import (
+        get_fundamentals,
+        get_earnings_dates,
+        get_macro_indicators,
+        get_sector_rotation,
+    )
 
     effective_lookback = max(lookback_days, 252)
     start_date, end_date = compute_date_range(trade_date, effective_lookback)
@@ -46,13 +52,46 @@ def gather_technical_data(ticker: str, trade_date: str, lookback_days: int) -> d
         {"symbol": ticker, "start_date": start_date, "end_date": end_date}
     )
 
+    # ── Company fundamentals profile (affects calibration rules) ──
+    try:
+        data["fundamentals_profile"] = get_fundamentals(
+            ticker=ticker, curr_date=trade_date
+        )
+    except Exception:
+        data["fundamentals_profile"] = ""
+
+    # ── Macro indicators for regime calibration ──
+    try:
+        data["macro_indicators"] = get_macro_indicators(curr_date=trade_date)
+    except Exception:
+        data["macro_indicators"] = ""
+
+    # ── Sector rotation for sector tailwind/headwind context ──
+    try:
+        data["sector_rotation"] = get_sector_rotation(
+            ticker=ticker, curr_date=trade_date
+        )
+    except Exception:
+        data["sector_rotation"] = ""
+
+    # ── Earnings dates (affects volatility & event-risk calibration) ──
+    try:
+        data["earnings_dates"] = get_earnings_dates(ticker=ticker)
+    except Exception:
+        data["earnings_dates"] = ""
+
     return data
 
 
 # ── Node factory ─────────────────────────────────────────────────────────────
 
 
-def create_market_analyst(reasoning_llm, code_agent, research_depth="medium", active_horizons=("long_term",)):
+def create_market_analyst(
+    reasoning_llm,
+    code_agent,
+    research_depth="medium",
+    active_horizons=("long_term", "medium_term", "short_term"),
+):
     """Create a market/technical analyst node for the outer AgentState graph.
 
     Parameters
@@ -67,7 +106,6 @@ def create_market_analyst(reasoning_llm, code_agent, research_depth="medium", ac
         "log_tag": "market",
         "state_key": "market_report",
         "gather_fn": gather_technical_data,
-        "phase1_system_prompt": PHASE1_PROMPT,
         "phase2_system_prompt": PHASE2_PROMPT,
         "phase3_system_prompt": PHASE3_PROMPT,
         "horizon_focus": HORIZON_FOCUS,
@@ -103,13 +141,13 @@ if __name__ == "__main__":
     ).get_llm()
     ca = CodeValidationAgent(
         model="minimax-m2.7:cloud",
-        timeout=60,
-        max_iterations=5,
+        timeout=120,
+        max_iterations=8,
         analyst_type="market",
         project_root=_project_root,
         verbose=False,
     )
-    node = create_market_analyst(llm, ca, "shallow", active_horizons=("long_term",))
-    result = node({"company_of_interest": "SPY", "trade_date": "2025-03-14"})
+    node = create_market_analyst(llm, ca, "shallow")
+    result = node({"company_of_interest": "AAPL", "trade_date": "2026-03-14"})
     report = ResearchReport.model_validate_json(result.get("market_report", "{}"))
     print(report.model_dump_json(indent=2))
