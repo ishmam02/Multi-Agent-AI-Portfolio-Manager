@@ -198,10 +198,10 @@ class CodeValidationAgent:
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
-    def _log(self, tag: str, text: str, *, truncate: int = 500) -> None:
+    def _log(self, tag: str, text: str, *, truncate: int = 0) -> None:
         """Print a timestamped log line when verbose=True AND write to file logger."""
         ts = datetime.now().strftime("%H:%M:%S")
-        body = text[:truncate] + ("…" if len(text) > truncate else "")
+        body = text[:truncate] if truncate > 0 else text
 
         # Always write to file logger if work_dir is set
         if self._current_work_dir:
@@ -721,6 +721,8 @@ class CodeValidationAgent:
                 }
                 if "computation_trace_id" in m:
                     entry["computation_trace_id"] = str(m["computation_trace_id"])
+                if "term" in m:
+                    entry["term"] = str(m["term"])
                 metrics.append(entry)
         traces = [
             {
@@ -941,6 +943,9 @@ class CodeValidationAgent:
             + f"\nIMPORTANT: Start immediately. Read {script_path} first, then overwrite "
             f"it with a heredoc (`cat > {script_path} << 'PYEOF' ... PYEOF`) and run "
             f"it with `python3 {script_path}`.\n"
+            "CRITICAL: You MUST use ONLY the exact absolute path above for metrics.py. "
+            "Do NOT use a relative path like `cat > metrics.py`. Do NOT guess or invent "
+            "any other directory. The scaffold already exists at that exact path; overwrite it there.\n"
             "Keep these helpers exactly as-is:\n"
             "  • `build_computation_trace(func, inputs, output)`\n"
             "  • `build_computed_metric(metric_name, value, trace)`\n\n"
@@ -1147,7 +1152,7 @@ class CodeValidationAgent:
                             try:
                                 evt = json.loads(line)
                             except json.JSONDecodeError:
-                                self._log("STREAM", line[:300])
+                                self._log("STREAM", line)
                                 continue
 
                             evt_type = evt.get("type", "")
@@ -1170,10 +1175,10 @@ class CodeValidationAgent:
                             elif evt_type in ("system", "user"):
                                 self._log(
                                     f"EVT:{evt_type}",
-                                    json.dumps(evt, default=str)[:300],
+                                    json.dumps(evt, default=str),
                                 )
                             else:
-                                self._log(f"EVT:{evt_type}", line[:200])
+                                self._log(f"EVT:{evt_type}", line)
 
                         if timed_out:
                             proc.kill()
@@ -1181,7 +1186,7 @@ class CodeValidationAgent:
                             elapsed = time.monotonic() - t_start
                             self._log("CLI", f"Timed out after {elapsed:.1f}s")
                             if stderr_out:
-                                self._log("CLI", f"stderr: {stderr_out[:500]}")
+                                self._log("CLI", f"stderr: {stderr_out}")
                         else:
                             proc.wait(timeout=30)
                             elapsed = time.monotonic() - t_start
@@ -1191,7 +1196,7 @@ class CodeValidationAgent:
                             if proc.returncode != 0:
                                 stderr_out = proc.stderr.read()
                                 if stderr_out:
-                                    self._log("CLI", f"stderr: {stderr_out[:500]}")
+                                    self._log("CLI", f"stderr: {stderr_out}")
 
                     except subprocess.TimeoutExpired:
                         proc.kill()

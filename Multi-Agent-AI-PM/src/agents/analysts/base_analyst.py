@@ -563,7 +563,13 @@ def _parse_thesis_json(text: str) -> dict:
 
 
 def _is_multi_horizon_thesis_json(d: dict) -> bool:
-    """True if *d* is a multi-horizon thesis object with per-horizon entries."""
+    """True if *d* is a multi-horizon thesis object with per-horizon entries.
+
+    Validation is lenient: each horizon only needs an "investment_thesis" key.
+    Missing keys (conviction, catalysts, risks, etc.) are filled with defaults
+    downstream. This avoids rejecting valid multi-horizon output because one
+    horizon omitted a field.
+    """
     if not isinstance(d, dict) or "horizons" not in d:
         return False
     horizons = d.get("horizons")
@@ -572,18 +578,14 @@ def _is_multi_horizon_thesis_json(d: dict) -> bool:
     for h_data in horizons.values():
         if not isinstance(h_data, dict):
             return False
-        if not _THESIS_REQUIRED_KEYS.issubset(h_data):
+        # Minimum requirement: must have at least an investment_thesis
+        if "investment_thesis" not in h_data:
             return False
-        # Validate nested lists
-        vi = h_data.get("value_interpretations")
-        if vi is not None and not isinstance(vi, list):
-            return False
-        cats = h_data.get("key_catalysts")
-        if cats is not None and not isinstance(cats, list):
-            return False
-        risks = h_data.get("key_risks")
-        if risks is not None and not isinstance(risks, list):
-            return False
+        # Validate nested list types if present
+        for list_key in ("value_interpretations", "key_catalysts", "key_risks"):
+            val = h_data.get(list_key)
+            if val is not None and not isinstance(val, list):
+                return False
     return True
 
 
@@ -1011,7 +1013,8 @@ def build_3phase_subgraph(
                     if isinstance(hv, dict):
                         per_horizon_metrics[h] = hv.get("computed_metrics", [])
 
-            if per_horizon_metrics:
+            has_per_horizon_metrics = any(metrics for metrics in per_horizon_metrics.values())
+            if has_per_horizon_metrics:
                 for h, metrics in per_horizon_metrics.items():
                     for m in metrics:
                         trace_id = m.get("computation_trace_id") or str(uuid.uuid4())
@@ -1033,7 +1036,7 @@ def build_3phase_subgraph(
                     all_metrics.append(
                         ComputedMetric(
                             metric_name=m["metric_name"],
-                            term="long_term",
+                            term=m.get("term", "long_term"),
                             value=m["value"],
                             metric_interpretation=interpretation_lookup.get(
                                 m["metric_name"], m.get("metric_interpretation", "")
@@ -1245,7 +1248,15 @@ def build_3phase_subgraph(
                 "additional_metrics_needed": single_thesis.get("additional_metrics_needed", ""),
             }
             for h in active_horizons:
-                raw_thesis["horizons"][h] = single_thesis
+                # Make a shallow copy and prepend horizon context so the thesis
+                # is not identically replicated across all horizons.
+                h_copy = dict(single_thesis)
+                thesis_text = h_copy.get("investment_thesis", "")
+                if thesis_text:
+                    h_copy["investment_thesis"] = (
+                        f"[{h.upper().replace('_', ' ')}] {thesis_text}"
+                    )
+                raw_thesis["horizons"][h] = h_copy
             _log(
                 f"{agent_type.value}|{sub_state['ticker']}|multi",
                 f"phase3_thesis: parsed SINGLE-HORIZON thesis JSON (replicated):\n{json.dumps(raw_thesis, indent=2)}",

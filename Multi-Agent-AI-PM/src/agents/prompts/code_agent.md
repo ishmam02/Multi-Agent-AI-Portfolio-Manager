@@ -75,14 +75,14 @@ CRITICAL WORKFLOW ORDER — always follow this sequence:
   3. Never search the web before attempting to write and run code.
 
 Bash
-  • Overwrite metrics.py using a heredoc, e.g.:
-      cat > metrics.py << 'PYEOF'
+  • Overwrite metrics.py using a heredoc with the FULL ABSOLUTE path, e.g.:
+      cat > {work_dir}/metrics.py << 'PYEOF'
       import numpy as np
       ...
       PYEOF
-      python3 metrics.py
+      python3 {work_dir}/metrics.py
   • Capture and inspect stdout/stderr.
-  • Keep iterating (fix → save → run) until `python3 metrics.py` exits 0
+  • Keep iterating (fix → save → run) until `python3 {work_dir}/metrics.py` exits 0
     and prints valid JSON with NO errors.  Do not stop at the first draft.
   • NEVER run `pip install` — all allowed libraries are already installed.
   • Do NOT run `ls` — you already have the directory listing above.
