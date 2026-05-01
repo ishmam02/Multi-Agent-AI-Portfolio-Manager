@@ -31,6 +31,10 @@ if _project_root not in sys.path:
 from src.llm_clients import create_llm_client
 from src.agents.analysts.news_analyst import create_news_analyst
 from src.agents.utils.schemas import ResearchReport
+from src.backtest._proc_utils import (
+    init_worker_process_group,
+    install_executor_cleanup,
+)
 
 # ── Default config ───────────────────────────────────────────────────────────────
 DEFAULT_REGIMES = [
@@ -253,7 +257,11 @@ def main():
     results: list[dict] = []
     errors = 0
 
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=init_worker_process_group,
+    ) as pool:
+        install_executor_cleanup(pool)
         futures = {pool.submit(_run_once, td, args.depth): td for td in test_dates}
         for fut in as_completed(futures):
             res = fut.result()

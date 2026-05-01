@@ -8,100 +8,105 @@ Usage:
     python run_all_experiments.py
 """
 
+import atexit
+import datetime
+import os
+import pathlib
+import signal
 import subprocess
 import sys
-import pathlib
-import datetime
+
+
+# Active child phase Popen — tracked so signal handlers can tear down the
+# entire phase process tree (workers + ollama launch + claude --bare).
+_active_proc: subprocess.Popen | None = None
+
+
+def _kill_active_proc(sig: int = signal.SIGTERM) -> None:
+    proc = _active_proc
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _signal_handler(signum: int, _frame) -> None:
+    _kill_active_proc(signal.SIGTERM)
+    # Give the phase a moment to do its own cleanup, then escalate.
+    proc = _active_proc
+    if proc is not None:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _kill_active_proc(signal.SIGKILL)
+    sys.exit(128 + signum)
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+atexit.register(lambda: _kill_active_proc(signal.SIGKILL))
 
 EXPERIMENTS = [
     (
-        "Phase 1: Fundamental Deviation Test",
+        "Phase 5: System Backtest",
         [
-            sys.executable, "-m", "src.backtest.deviation_test",
-            "--analyst", "fundamental",
-            "--ticker", "AAPL",
-            "--date", "2025-03-14",
-            "--runs", "8",
-            "--workers", "8",
-            "--depth", "shallow",
+            sys.executable,
+            "-m",
+            "src.backtest.system_backtest",
+            "--ticker",
+            "AAPL,XOM,JNJ",
+            "--workers",
+            "3",
+            "--research-depth",
+            "shallow",
+            "--results-dir",
+            "experiment_results/system_backtest",
         ],
-        "experiment_results/deviation_fundamental.log",
+        "experiment_results/backtest_system.log",
     ),
     (
-        "Phase 2: Market Deviation Test",
+        "Phase 6: Fundamental Analyst Backtest",
         [
-            sys.executable, "-m", "src.backtest.deviation_test",
-            "--analyst", "market",
-            "--ticker", "AAPL",
-            "--date", "2025-03-14",
-            "--runs", "8",
-            "--workers", "8",
-            "--depth", "shallow",
-        ],
-        "experiment_results/deviation_market.log",
-    ),
-    (
-        "Phase 3: News Deviation Test",
-        [
-            sys.executable, "-m", "src.backtest.deviation_test",
-            "--analyst", "news",
-            "--ticker", "AAPL",
-            "--date", "2025-03-14",
-            "--runs", "8",
-            "--workers", "8",
-            "--depth", "shallow",
-        ],
-        "experiment_results/deviation_news.log",
-    ),
-    (
-        "Phase 4: Synthesis Deviation Test",
-        [
-            sys.executable, "-m", "src.backtest.trader_deviation_test",
-            "--ticker", "AAPL",
-            "--date", "2025-03-14",
-            "--runs", "8",
-            "--workers", "4",
-            "--depth", "shallow",
-        ],
-        "experiment_results/deviation_synthesis.log",
-    ),
-    (
-        "Phase 5: Fundamental Analyst Backtest",
-        [
-            sys.executable, "-m", "src.backtest.fundamentals_analyst_backtest",
-            "--workers", "8",
-            "--depth", "shallow",
+            sys.executable,
+            "-m",
+            "src.backtest.fundamentals_analyst_backtest",
+            "--workers",
+            "8",
+            "--depth",
+            "shallow",
         ],
         "experiment_results/backtest_fundamental.log",
     ),
     (
-        "Phase 6: Market Analyst Backtest",
+        "Phase 7: Market Analyst Backtest",
         [
-            sys.executable, "-m", "src.backtest.market_analyst_backtest",
-            "--workers", "8",
-            "--depth", "shallow",
+            sys.executable,
+            "-m",
+            "src.backtest.market_analyst_backtest",
+            "--workers",
+            "8",
+            "--depth",
+            "shallow",
         ],
         "experiment_results/backtest_market.log",
     ),
     (
-        "Phase 7: News Analyst Backtest",
+        "Phase 8: News Analyst Backtest",
         [
-            sys.executable, "-m", "src.backtest.news_analyst_backtest",
-            "--workers", "8",
-            "--depth", "shallow",
+            sys.executable,
+            "-m",
+            "src.backtest.news_analyst_backtest",
+            "--workers",
+            "8",
+            "--depth",
+            "shallow",
         ],
         "experiment_results/backtest_news.log",
-    ),
-    (
-        "Phase 8: System Backtest",
-        [
-            sys.executable, "-m", "src.backtest.system_backtest",
-            "--ticker", "SPY",
-            "--workers", "2",
-            "--research-depth", "shallow",
-            "--results-dir", "experiment_results/system_backtest",
-        ],
-        "experiment_results/backtest_system.log",
     ),
 ]
 
@@ -123,20 +128,26 @@ def run_phase(name: str, cmd: list[str], log_path: str) -> bool:
         log_file.write(f"# Started: {datetime.datetime.now().isoformat()}\n")
         log_file.flush()
 
+        global _active_proc
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
+        _active_proc = proc
 
-        # Stream output to both console and log file in real time
-        for line in proc.stdout:
-            print(line, end="")
-            log_file.write(line)
-            log_file.flush()
+        try:
+            # Stream output to both console and log file in real time
+            for line in proc.stdout:
+                print(line, end="")
+                log_file.write(line)
+                log_file.flush()
 
-        proc.wait()
+            proc.wait()
+        finally:
+            _active_proc = None
 
         log_file.write(f"\n# Finished: {datetime.datetime.now().isoformat()}\n")
         log_file.write(f"# Exit code: {proc.returncode}\n")

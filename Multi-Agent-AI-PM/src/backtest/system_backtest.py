@@ -17,7 +17,6 @@ import pathlib
 import random
 import statistics
 import sys
-import threading
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -31,17 +30,21 @@ _project_root = str(pathlib.Path(__file__).resolve().parents[2])
 sys.path.insert(0, _project_root)
 
 from src.agents.utils.schemas import CompositeSignal, ResearchReport  # noqa: E402
+from src.backtest._proc_utils import (  # noqa: E402
+    init_worker_process_group,
+    install_executor_cleanup,
+)
 from src.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 
 
 # ── Regime definitions (label, start, end, samples) ──────────────────────────
 DEFAULT_REGIMES: List[Tuple[str, str, str, int]] = [
-    ("Post-GFC recovery", "2010-01-01", "2013-12-31", 8),
-    ("Mid bull", "2014-01-01", "2017-12-31", 8),
-    ("Volatile / trade war", "2018-01-01", "2019-12-31", 8),
+    ("Post-GFC recovery", "2010-01-01", "2013-12-31", 4),
+    ("Mid bull", "2014-01-01", "2017-12-31", 4),
+    ("Volatile / trade war", "2018-01-01", "2019-12-31", 4),
     ("COVID crash", "2020-02-15", "2020-03-31", 4),
-    ("Recovery bull", "2020-04-01", "2021-12-31", 8),
-    ("2022 bear", "2022-01-01", "2022-10-31", 8),
+    ("Recovery bull", "2020-04-01", "2021-12-31", 4),
+    ("2022 bear", "2022-01-01", "2022-10-31", 4),
     ("Post-bear bull", "2022-11-01", "2024-12-01", 4),
 ]
 
@@ -268,6 +271,25 @@ def run_single(
     return result, final_state
 
 
+def _run_one_job(args_tuple, config_dict):
+    """Module-level wrapper so ProcessPoolExecutor can pickle it."""
+    ticker, trade_date, start_px, end_prices, regime = args_tuple
+    try:
+        res, final_state = run_single(
+            ticker, trade_date, start_px, end_prices, regime, config_dict
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        res = BacktestResult(
+            date=trade_date,
+            regime=regime,
+            ticker=ticker,
+            error=str(exc),
+        )
+        final_state = None
+    return res, final_state
+
+
 def _report_batch(label: str, rows: List[BacktestResult], horizon: str = "long"):
     """Print metrics for a batch of results at a given horizon."""
     actual_key = f"actual_ret_{horizon}"
@@ -480,7 +502,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Backtest the full TradingAgentsGraph across market regimes."
     )
-    parser.add_argument("--ticker", default="SPY", help="Ticker to backtest")
+    parser.add_argument("--ticker", default="SPY", help="Comma-separated tickers to backtest")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--workers", type=int, default=1, help="Max concurrent graph runs"
@@ -536,71 +558,73 @@ def main():
         regimes = [(label, s, e, max(1, n // 2)) for label, s, e, n in regimes]
         print("QUICK MODE: sample counts halved\n")
 
+    # ── Parse tickers ──
+    tickers = [t.strip().upper() for t in args.ticker.split(",") if t.strip()]
+    print(f"Tickers: {tickers}\n")
+
     # ── Sample dates ──
-    dates = sample_dates(args.ticker, regimes, args.horizons, random_seed=args.seed)
-    if not dates:
+    all_dates: List[Tuple[str, str, float, Dict[str, Optional[float]], str]] = []
+    for ticker in tickers:
+        dates = sample_dates(ticker, regimes, args.horizons, random_seed=args.seed)
+        for trade_date, start_px, end_prices, regime in dates:
+            all_dates.append((ticker, trade_date, start_px, end_prices, regime))
+
+    if not all_dates:
         print("No dates sampled. Exiting.")
         return
 
-    # ── Prepare run directory ──
+    print(f"Total dates to run: {len(all_dates)}\n")
+
+    # ── Prepare run directory (creation deferred until first write) ──
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.results_dir, f"run_{args.ticker}_{timestamp}")
+    tickers_tag = "_".join(tickers)
+    run_dir = os.path.join(args.results_dir, f"run_{tickers_tag}_{timestamp}")
     states_dir = os.path.join(run_dir, "states")
-    os.makedirs(states_dir, exist_ok=True)
 
     # ── Run backtest ──
     results: List[BacktestResult] = []
-    results_lock = threading.Lock()
+    print(f"Running backtest with max {args.workers} concurrent workers ...")
+    futures: List[Any] = []
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=init_worker_process_group,
+    ) as executor:
+        install_executor_cleanup(executor)
+        for d in all_dates:
+            futures.append(executor.submit(_run_one_job, d, config))
 
-    def _run_one(args_tuple):
-        trade_date, start_px, end_prices, regime = args_tuple
-        try:
-            res, final_state = run_single(
-                args.ticker,
-                trade_date,
-                start_px,
-                end_prices,
-                regime,
-                config,
-            )
-        except Exception as exc:
-            traceback.print_exc()
-            res = BacktestResult(
-                date=trade_date,
-                regime=regime,
-                ticker=args.ticker,
-                error=str(exc),
-            )
-            final_state = None
-
+    for fut in futures:
+        res, final_state = fut.result()
         # Persist full graph state when available
         if final_state is not None:
-            state_path = os.path.join(states_dir, f"state_{trade_date}.json")
+            if not os.path.isdir(states_dir):
+                os.makedirs(states_dir, exist_ok=True)
+            state_path = os.path.join(states_dir, f"state_{res.ticker}_{res.date}.json")
             try:
                 _save_state(final_state, state_path)
             except Exception as e:
-                print(f"    WARN: could not save state for {trade_date}: {e}")
-
-        with results_lock:
-            results.append(res)
+                print(f"    WARN: could not save state for {res.ticker} {res.date}: {e}")
+        results.append(res)
         status = "OK" if res.error is None else f"ERR: {res.error[:40]}"
         print(
-            f"  [{regime}] {trade_date}  "
+            f"  [{res.regime}] {res.ticker} {res.date}  "
             f"mu={res.pred_mu:+.4f}  dec={res.decision}  {status}"
         )
-
-    print(f"Running backtest with max {args.workers} concurrent workers ...")
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        for d in dates:
-            executor.submit(_run_one, d)
 
     # ── Report ──
     report(results)
 
     # ── Save all artifacts ──
-    # 1. JSON summary
-    json_path = os.path.join(run_dir, "summary.json")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # 1. JSON summary (also save flat to results_dir for parse_results.py)
+    os.makedirs(args.results_dir, exist_ok=True)
+    json_path = os.path.join(args.results_dir, "summary.json")
     with open(json_path, "w") as f:
+        json.dump([r.__dict__ for r in results], f, indent=2, default=str)
+    # Also save inside run_dir for record-keeping
+    json_path_run = os.path.join(run_dir, "summary.json")
+    with open(json_path_run, "w") as f:
         json.dump([r.__dict__ for r in results], f, indent=2, default=str)
 
     # 2. CSV summary
