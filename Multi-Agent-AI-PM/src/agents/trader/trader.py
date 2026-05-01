@@ -230,7 +230,7 @@ def _sample_weights(
 Your task is to assign per-analyst, per-horizon weights that sum to 1.0 for each horizon.
 
 Available analysts and their signals:
-{{reports_json}}
+{json.dumps(reports_json, indent=2)}
 
 Instructions:
 1. Assign weights for each horizon ({horizon_names}).
@@ -259,11 +259,7 @@ Output ONLY the JSON object. No markdown fences, no extra text."""
                 SystemMessage(
                     content="You are a senior portfolio manager synthesizing multi-analyst research."
                 ),
-                HumanMessage(
-                    content=phase1_prompt.format(
-                        reports_json=json.dumps(reports_json, indent=2)
-                    )
-                ),
+                HumanMessage(content=phase1_prompt),
             ]
         )
         parsed = _extract_json_block(result.content)
@@ -722,9 +718,15 @@ def create_synthesis_agent(
                 analyst_weights=HorizonWeights(),
                 horizon_blend_weights=HorizonValues(**blend_defaults),
                 weighting_rationale="No analyst reports available; defaulting to neutral signal.",
+                composite_thesis=HorizonThesis(
+                    long_term="No reports available.",
+                    medium_term="No reports available.",
+                    short_term="No reports available.",
+                ),
                 cross_signal_conflicts=[],
                 unresolved_penalty=0.0,
                 source_reports=[],
+                computation_provenance="fallback_no_reports",
             )
             return {
                 "messages": [

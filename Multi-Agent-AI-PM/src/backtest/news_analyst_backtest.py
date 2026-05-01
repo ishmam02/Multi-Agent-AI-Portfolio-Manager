@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import pathlib
 import random
 import statistics
@@ -42,7 +43,7 @@ DEFAULT_REGIMES = [
     ("Post-bear bull", "2022-11-01", "2024-12-01", 1),
 ]
 
-DEFAULT_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "JPM", "WMT"]
+DEFAULT_TICKERS = ["AAPL", "JPM", "XOM", "JNJ"]
 
 # ── Thread-local analyst nodes ─────────────────────────────────────────────────
 _thread_local = threading.local()

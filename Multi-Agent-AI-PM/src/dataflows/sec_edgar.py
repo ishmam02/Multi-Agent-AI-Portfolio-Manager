@@ -1,4 +1,5 @@
 import os
+import threading
 import warnings
 import logging
 import pandas as pd
@@ -21,6 +22,11 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None  # type: ignore
+
+
+# Thread-safe lock for edgartools — the library is not thread-safe and deadlocks
+# under concurrent access from multiple workers.
+_EDGAR_LOCK = threading.Lock()
 
 
 def _ensure_identity():
@@ -51,114 +57,115 @@ def _extract_statement(
     Returns:
         DataFrame with metrics as rows and periods as columns
     """
-    _ensure_identity()
-    company = Company(ticker.upper())
+    with _EDGAR_LOCK:
+        _ensure_identity()
+        company = Company(ticker.upper())
 
-    form = "10-K" if freq.lower() == "annual" else "10-Q"
-    filings = company.get_filings(form=form, amendments=False)
+        form = "10-K" if freq.lower() == "annual" else "10-Q"
+        filings = company.get_filings(form=form, amendments=False)
 
-    all_periods: dict[str, pd.Series] = {}
+        all_periods: dict[str, pd.Series] = {}
 
-    for filing in filings:
-        try:
-            obj = filing.obj()
-            if not hasattr(obj, "financials"):
+        for filing in filings:
+            try:
+                obj = filing.obj()
+                if not hasattr(obj, "financials"):
+                    continue
+
+                fin = obj.financials
+                if statement_type == "income_statement":
+                    stmt = fin.income_statement()
+                elif statement_type == "balance_sheet":
+                    stmt = fin.balance_sheet()
+                elif statement_type == "cash_flow_statement":
+                    stmt = fin.cash_flow_statement()
+                else:
+                    raise ValueError(f"Unknown statement_type: {statement_type}")
+
+                df = stmt.to_dataframe()
+                mask = (~df["abstract"]) & (~df["dimension"])
+                clean = df[mask]
+
+                # Find period columns by detecting date-like column names
+                # Some statements use '2025-09-27 (FY)', others just '2025-09-27'
+                date_cols = []
+                for c in clean.columns:
+                    try:
+                        # Try parsing the date part (before any space)
+                        date_part = c.split(" ")[0]
+                        pd.Timestamp(date_part)
+                        # Exclude known non-date columns
+                        if c not in ("label", "concept", "standard_concept", "level",
+                                     "balance", "weight", "preferred_sign",
+                                     "parent_concept", "parent_abstract_concept",
+                                     "is_breakdown", "dimension_axis", "dimension_member",
+                                     "dimension_member_label", "dimension_label"):
+                            date_cols.append(c)
+                    except Exception:
+                        continue
+
+                for col in date_cols:
+                    if col in all_periods:
+                        continue
+                    period_data = clean[["label", col]].copy()
+                    period_data = period_data.dropna(subset=[col])
+                    period_data = period_data.drop_duplicates(subset="label", keep="first")
+                    if period_data.empty:
+                        continue
+                    series = period_data.set_index("label")[col]
+                    all_periods[col] = series
+
+            except Exception:
+                # Skip filings that fail to parse (older filings often lack XBRL)
                 continue
 
-            fin = obj.financials
-            if statement_type == "income_statement":
-                stmt = fin.income_statement()
-            elif statement_type == "balance_sheet":
-                stmt = fin.balance_sheet()
-            elif statement_type == "cash_flow_statement":
-                stmt = fin.cash_flow_statement()
-            else:
-                raise ValueError(f"Unknown statement_type: {statement_type}")
+        if not all_periods:
+            return pd.DataFrame()
 
-            df = stmt.to_dataframe()
-            mask = (~df["abstract"]) & (~df["dimension"])
-            clean = df[mask]
+        result = pd.DataFrame(all_periods)
+        result.index.name = "Metric"
 
-            # Find period columns by detecting date-like column names
-            # Some statements use '2025-09-27 (FY)', others just '2025-09-27'
-            date_cols = []
-            for c in clean.columns:
-                try:
-                    # Try parsing the date part (before any space)
-                    date_part = c.split(" ")[0]
-                    pd.Timestamp(date_part)
-                    # Exclude known non-date columns
-                    if c not in ("label", "concept", "standard_concept", "level",
-                                 "balance", "weight", "preferred_sign",
-                                 "parent_concept", "parent_abstract_concept",
-                                 "is_breakdown", "dimension_axis", "dimension_member",
-                                 "dimension_member_label", "dimension_label"):
-                        date_cols.append(c)
-                except Exception:
-                    continue
+        # Clean column names: '2025-09-27 (FY)' -> '2025-09-27'
+        result.columns = [c.split(" ")[0] for c in result.columns]
 
-            for col in date_cols:
-                if col in all_periods:
-                    continue
-                period_data = clean[["label", col]].copy()
-                period_data = period_data.dropna(subset=[col])
-                period_data = period_data.drop_duplicates(subset="label", keep="first")
-                if period_data.empty:
-                    continue
-                series = period_data.set_index("label")[col]
-                all_periods[col] = series
+        # Deduplicate columns — keep the first occurrence of each date
+        result = result.loc[:, ~result.columns.duplicated()]
 
-        except Exception:
-            # Skip filings that fail to parse (older filings often lack XBRL)
-            continue
+        # Sort columns chronologically
+        result = result.reindex(sorted(result.columns), axis=1)
 
-    if not all_periods:
-        return pd.DataFrame()
+        # Filter by curr_date if provided
+        if curr_date:
+            try:
+                cutoff = pd.Timestamp(curr_date)
+                valid_cols = [c for c in result.columns if pd.Timestamp(c) <= cutoff]
+                result = result[valid_cols]
+            except Exception:
+                pass
 
-    result = pd.DataFrame(all_periods)
-    result.index.name = "Metric"
+        # ── Noise reduction ──
+        # Keep only the most recent 20 periods (avoids ultra-wide CSVs)
+        if len(result.columns) > 20:
+            result = result.iloc[:, -20:]
 
-    # Clean column names: '2025-09-27 (FY)' -> '2025-09-27'
-    result.columns = [c.split(" ")[0] for c in result.columns]
+        # Drop rows that are >70% NaN (often footnote variants or stale metrics)
+        result = result.dropna(thresh=len(result.columns) * 0.3)
 
-    # Deduplicate columns — keep the first occurrence of each date
-    result = result.loc[:, ~result.columns.duplicated()]
+        # Deduplicate rows with nearly-identical names (e.g.
+        #   "Accounts receivable, less allowances of $104..."
+        #   "Accounts receivable, less allowances of $55...")
+        # Group by the first 3 lowercase words and keep the row with fewest NaNs.
+        if len(result) > 0:
+            def _clean_key(label: str) -> str:
+                words = str(label).lower().replace(",", "").split()
+                return " ".join(words[:3])
 
-    # Sort columns chronologically
-    result = result.reindex(sorted(result.columns), axis=1)
+            result["_dedup_key"] = result.index.map(_clean_key)
+            result["_na_count"] = result.isna().sum(axis=1)
+            result = result.sort_values("_na_count").drop_duplicates(subset="_dedup_key", keep="first")
+            result = result.drop(columns=["_dedup_key", "_na_count"])
 
-    # Filter by curr_date if provided
-    if curr_date:
-        try:
-            cutoff = pd.Timestamp(curr_date)
-            valid_cols = [c for c in result.columns if pd.Timestamp(c) <= cutoff]
-            result = result[valid_cols]
-        except Exception:
-            pass
-
-    # ── Noise reduction ──
-    # Keep only the most recent 20 periods (avoids ultra-wide CSVs)
-    if len(result.columns) > 20:
-        result = result.iloc[:, -20:]
-
-    # Drop rows that are >70% NaN (often footnote variants or stale metrics)
-    result = result.dropna(thresh=len(result.columns) * 0.3)
-
-    # Deduplicate rows with nearly-identical names (e.g.
-    #   "Accounts receivable, less allowances of $104..."
-    #   "Accounts receivable, less allowances of $55...")
-    # Group by the first 3 lowercase words and keep the row with fewest NaNs.
-    if len(result) > 0:
-        def _clean_key(label: str) -> str:
-            words = str(label).lower().replace(",", "").split()
-            return " ".join(words[:3])
-
-        result["_dedup_key"] = result.index.map(_clean_key)
-        result["_na_count"] = result.isna().sum(axis=1)
-        result = result.sort_values("_na_count").drop_duplicates(subset="_dedup_key", keep="first")
-        result = result.drop(columns=["_dedup_key", "_na_count"])
-
-    return result
+        return result
 
 
 def get_income_statement(
@@ -206,112 +213,114 @@ def get_fundamentals(
 ):
     """Get latest company profile metrics from SEC EDGAR filings.
     Returns key metrics from the most recent 10-K filing."""
-    _ensure_identity()
-    company = Company(ticker.upper())
+    with _EDGAR_LOCK:
+        _ensure_identity()
+        company = Company(ticker.upper())
 
-    try:
-        filings = company.get_filings(form="10-K", amendments=False)
-        if not filings:
-            return f"No SEC filings found for symbol '{ticker}'"
+        try:
+            filings = company.get_filings(form="10-K", amendments=False)
+            if not filings:
+                return f"No SEC filings found for symbol '{ticker}'"
 
-        obj = filings[0].obj()
-        if not hasattr(obj, "financials"):
-            return f"No financial data in latest filing for '{ticker}'"
+            obj = filings[0].obj()
+            if not hasattr(obj, "financials"):
+                return f"No financial data in latest filing for '{ticker}'"
 
-        # Use income statement to derive some basic metrics
-        inc = obj.financials.income_statement().to_dataframe()
-        mask = (~inc["abstract"]) & (~inc["dimension"])
-        clean = inc[mask]
+            # Use income statement to derive some basic metrics
+            inc = obj.financials.income_statement().to_dataframe()
+            mask = (~inc["abstract"]) & (~inc["dimension"])
+            clean = inc[mask]
 
-        # Extract revenue and net income from latest period
-        date_cols = []
-        for c in clean.columns:
-            try:
-                date_part = c.split(" ")[0]
-                pd.Timestamp(date_part)
-                if c not in ("label", "concept", "standard_concept", "level",
-                             "balance", "weight", "preferred_sign",
-                             "parent_concept", "parent_abstract_concept",
-                             "is_breakdown", "dimension_axis", "dimension_member",
-                             "dimension_member_label", "dimension_label"):
-                    date_cols.append(c)
-            except Exception:
-                continue
+            # Extract revenue and net income from latest period
+            date_cols = []
+            for c in clean.columns:
+                try:
+                    date_part = c.split(" ")[0]
+                    pd.Timestamp(date_part)
+                    if c not in ("label", "concept", "standard_concept", "level",
+                                 "balance", "weight", "preferred_sign",
+                                 "parent_concept", "parent_abstract_concept",
+                                 "is_breakdown", "dimension_axis", "dimension_member",
+                                 "dimension_member_label", "dimension_label"):
+                        date_cols.append(c)
+                except Exception:
+                    continue
 
-        if not date_cols:
-            return f"No financial metrics found for '{ticker}'"
+            if not date_cols:
+                return f"No financial metrics found for '{ticker}'"
 
-        latest_col = date_cols[0]
-        latest_date = latest_col.split(" ")[0]
+            latest_col = date_cols[0]
+            latest_date = latest_col.split(" ")[0]
 
-        # Build a simple profile from available metrics
-        metrics = {}
-        for _, row in clean.iterrows():
-            label = str(row["label"]).lower().strip()
-            val = row.get(latest_col)
-            if val and not pd.isna(val):
-                metrics[label] = val
+            # Build a simple profile from available metrics
+            metrics = {}
+            for _, row in clean.iterrows():
+                label = str(row["label"]).lower().strip()
+                val = row.get(latest_col)
+                if val and not pd.isna(val):
+                    metrics[label] = val
 
-        # Map common labels
-        def find_metric(*keys):
-            for k in keys:
-                for label, val in metrics.items():
-                    if k in label:
-                        return val
-            return None
+            # Map common labels
+            def find_metric(*keys):
+                for k in keys:
+                    for label, val in metrics.items():
+                        if k in label:
+                            return val
+                return None
 
-        revenue = find_metric("net sales", "revenue", "total revenues", "sales")
-        net_income = find_metric("net income", "net earnings", "net profit")
-        gross_profit = find_metric("gross margin", "gross profit")
-        operating_income = find_metric("operating income")
+            revenue = find_metric("net sales", "revenue", "total revenues", "sales")
+            net_income = find_metric("net income", "net earnings", "net profit")
+            gross_profit = find_metric("gross margin", "gross profit")
+            operating_income = find_metric("operating income")
 
-        fields = [
-            ("Name", company.name),
-            ("Latest Fiscal Period", latest_date),
-            ("Revenue", revenue),
-            ("Net Income", net_income),
-            ("Gross Profit", gross_profit),
-            ("Operating Income", operating_income),
-        ]
+            fields = [
+                ("Name", company.name),
+                ("Latest Fiscal Period", latest_date),
+                ("Revenue", revenue),
+                ("Net Income", net_income),
+                ("Gross Profit", gross_profit),
+                ("Operating Income", operating_income),
+            ]
 
-        import csv
-        import io
+            import csv
+            import io
 
-        present = [(label, value) for label, value in fields if value is not None]
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow([label for label, _ in present])
-        writer.writerow([value for _, value in present])
-        return buf.getvalue()
+            present = [(label, value) for label, value in fields if value is not None]
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow([label for label, _ in present])
+            writer.writerow([value for _, value in present])
+            return buf.getvalue()
 
-    except Exception as e:
-        return f"Error retrieving fundamentals for {ticker}: {str(e)}"
+        except Exception as e:
+            return f"Error retrieving fundamentals for {ticker}: {str(e)}"
 
 
 def get_earnings_dates(
     ticker: Annotated[str, "ticker symbol of the company"],
 ):
     """Get filing dates (10-K and 10-Q) as proxy for earnings dates from SEC EDGAR."""
-    _ensure_identity()
-    company = Company(ticker.upper())
+    with _EDGAR_LOCK:
+        _ensure_identity()
+        company = Company(ticker.upper())
 
-    try:
-        filings_10k = company.get_filings(form="10-K", amendments=False)
-        filings_10q = company.get_filings(form="10-Q", amendments=False)
+        try:
+            filings_10k = company.get_filings(form="10-K", amendments=False)
+            filings_10q = company.get_filings(form="10-Q", amendments=False)
 
-        dates = []
-        for f in filings_10k:
-            dates.append({"date": str(f.filing_date), "form": "10-K"})
-        for f in filings_10q:
-            dates.append({"date": str(f.filing_date), "form": "10-Q"})
+            dates = []
+            for f in filings_10k:
+                dates.append({"date": str(f.filing_date), "form": "10-K"})
+            for f in filings_10q:
+                dates.append({"date": str(f.filing_date), "form": "10-Q"})
 
-        if not dates:
-            return f"No filing dates found for symbol '{ticker}'"
+            if not dates:
+                return f"No filing dates found for symbol '{ticker}'"
 
-        df = pd.DataFrame(dates)
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date", ascending=False)
-        return df.to_csv(index=False)
+            df = pd.DataFrame(dates)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date", ascending=False)
+            return df.to_csv(index=False)
 
-    except Exception as e:
-        return f"Error retrieving filing dates for {ticker}: {str(e)}"
+        except Exception as e:
+            return f"Error retrieving filing dates for {ticker}: {str(e)}"

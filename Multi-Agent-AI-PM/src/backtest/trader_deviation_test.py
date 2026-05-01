@@ -26,11 +26,9 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from src.llm_clients import create_llm_client
-from src.agents.code_agent.code_agent import CodeValidationAgent
 from src.agents.trader.trader import create_synthesis_agent
 from src.agents.utils.schemas import (
     AgentType,
-    AnalystWeights,
     Catalyst,
     Citation,
     CompositeSignal,
@@ -38,7 +36,6 @@ from src.agents.utils.schemas import (
     HorizonThesis,
     HorizonTraceIds,
     HorizonValues,
-    HorizonWeights,
     ResearchReport,
     Risk,
 )
@@ -166,13 +163,13 @@ def _build_mock_state(ticker: str, trade_date: str) -> dict:
         AgentType.MARKET,
         ticker,
         trade_date,
-        mu={"long_term": 0.08, "medium_term": 0.04, "short_term": -0.02},
-        sigma={"long_term": 0.18, "medium_term": 0.14, "short_term": 0.22},
-        conviction={"long_term": 0.72, "medium_term": 0.55, "short_term": 0.40},
+        mu={"long_term": 0.3147, "medium_term": 0.0916, "short_term": 0.0200},
+        sigma={"long_term": 0.3099, "medium_term": 0.3099, "short_term": 0.3164},
+        conviction={"long_term": 0.94, "medium_term": 0.96, "short_term": 0.99},
         thesis={
-            "long_term": "Technical trend bullish with 200-day SMA support.",
-            "medium_term": "RSI neutral; consolidation expected.",
-            "short_term": "Overbought near-term; pullback likely.",
+            "long_term": "AAPL presents a uniformly bullish long-term outlook anchored by mu=0.3147, with signal_concordance=1.0 across all 8 empirical signals confirming historical precedent. The ema_cross_signal=0.472 and sma_cross_signal=0.366 (50-SMA/200-SMA golden cross regime) suggest sustained structural uptrend. XLK momentum=+8.73% provides sector corroboration, while VIX=16.89 reflects benign macro backdrop. Risks include sigma=0.31 (30.99% vol) amplified by Beta=1.109 and P/B=45.24 suggesting valuation premium. The 255-signal k-NN framework provides robust statistical grounding, though signal_dispersion=0.071 (low) warrants monitoring for regime shifts.",
+            "medium_term": "AAPL's medium-term outlook is cautiously bullish with mu=0.0916 (9.16% annualised expected return) derived from unanimous signal_concordance=1.0. Signal strength is moderate (range 0.024-0.154) with ema_cross_signal=0.154 and price_50sma_signal=0.144 strongest. The sma_cross_signal=0.024 (weakest) and macdh_signal=0.066 suggest momentum is softening versus long-term view. Earnings at Jan 2026 (10 months away) eliminates near-term event risk. With signal_dispersion=0.042, signals are tightly clustered, confirming consensus but with less conviction than long-term.",
+            "short_term": "AAPL's short-term outlook (12-day horizon) shows mu=0.020 (2.0% annualised return) with signal_concordance=1.0 confirming unanimous bullish signal. However, absolute signal magnitudes are minimal (0.006-0.028), indicating near-neutral short-term expectation. The price_50sma_signal=0.028 and ema_cross_signal=0.020 provide marginal support. With sigma=0.316 (31.6% annualised), short-term risk/reward is unfavorable. signal_dispersion=0.0075 (tightest across all horizons) confirms consensus but reflects low conviction. AAPL near 52-week high (288.62 vs ~230 current) suggests limited immediate upside. VIX=16.89 confirms low volatility backdrop favorable for stable prices.",
         },
     )
 
@@ -180,13 +177,13 @@ def _build_mock_state(ticker: str, trade_date: str) -> dict:
         AgentType.FUNDAMENTAL,
         ticker,
         trade_date,
-        mu={"long_term": 0.12, "medium_term": 0.06, "short_term": 0.01},
-        sigma={"long_term": 0.15, "medium_term": 0.12, "short_term": 0.10},
-        conviction={"long_term": 0.80, "medium_term": 0.60, "short_term": 0.30},
+        mu={"long_term": -0.2410, "medium_term": -0.1807, "short_term": -0.1205},
+        sigma={"long_term": 1.2858, "medium_term": 1.0929, "short_term": 0.9000},
+        conviction={"long_term": 0.87, "medium_term": 0.17, "short_term": 0.13},
         thesis={
-            "long_term": "DCF implies 15% upside; strong free cash flow.",
-            "medium_term": "Earnings growth stable; margins improving.",
-            "short_term": "Valuation fair; no near-term catalyst.",
+            "long_term": "[LONG TERM] Apple Inc. presents a challenging long-term outlook driven by strong model disagreement on valuation direction but consensus on negative near-term returns. The composite mu of -24.1% reflects deeply negative expected returns across 255 signal combinations. The multiples_implied_price of $290.41 suggests 7% upside potential, while the residual_income_value of $11.06 indicates 96% overvaluation on residual income basis. Signal concordance of 0.86 shows high model agreement on negative direction despite 0.73 dispersion. Quality_score of 0.5 is neutral while financial_health_score of 0.96 reflects excellent balance sheet. Growth_score of -0.612 signals secular deceleration. As a high-beta tech name (Beta 1.109) with modest 0.38% dividend yield and $3.98T market cap, Apple's wide model dispersion is expected. The medium_term mu of -18.1% and short_term mu of -12.0% show negative expected returns across all horizons, with decreasing severity at shorter terms.",
+            "medium_term": "[MEDIUM TERM] Apple Inc. presents a challenging long-term outlook driven by strong model disagreement on valuation direction but consensus on negative near-term returns. The composite mu of -24.1% reflects deeply negative expected returns across 255 signal combinations. The multiples_implied_price of $290.41 suggests 7% upside potential, while the residual_income_value of $11.06 indicates 96% overvaluation on residual income basis. Signal concordance of 0.86 shows high model agreement on negative direction despite 0.73 dispersion. Quality_score of 0.5 is neutral while financial_health_score of 0.96 reflects excellent balance sheet. Growth_score of -0.612 signals secular deceleration. As a high-beta tech name (Beta 1.109) with modest 0.38% dividend yield and $3.98T market cap, Apple's wide model dispersion is expected. The medium_term mu of -18.1% and short_term mu of -12.0% show negative expected returns across all horizons, with decreasing severity at shorter terms.",
+            "short_term": "[SHORT TERM] Apple Inc. presents a challenging long-term outlook driven by strong model disagreement on valuation direction but consensus on negative near-term returns. The composite mu of -24.1% reflects deeply negative expected returns across 255 signal combinations. The multiples_implied_price of $290.41 suggests 7% upside potential, while the residual_income_value of $11.06 indicates 96% overvaluation on residual income basis. Signal concordance of 0.86 shows high model agreement on negative direction despite 0.73 dispersion. Quality_score of 0.5 is neutral while financial_health_score of 0.96 reflects excellent balance sheet. Growth_score of -0.612 signals secular deceleration. As a high-beta tech name (Beta 1.109) with modest 0.38% dividend yield and $3.98T market cap, Apple's wide model dispersion is expected. The medium_term mu of -18.1% and short_term mu of -12.0% show negative expected returns across all horizons, with decreasing severity at shorter terms.",
         },
     )
 
@@ -194,13 +191,13 @@ def _build_mock_state(ticker: str, trade_date: str) -> dict:
         AgentType.NEWS,
         ticker,
         trade_date,
-        mu={"long_term": 0.05, "medium_term": 0.02, "short_term": -0.05},
-        sigma={"long_term": 0.20, "medium_term": 0.18, "short_term": 0.25},
-        conviction={"long_term": 0.50, "medium_term": 0.45, "short_term": 0.35},
+        mu={"long_term": 0.10, "medium_term": -0.05, "short_term": -0.15},
+        sigma={"long_term": 0.20, "medium_term": 0.25, "short_term": 0.30},
+        conviction={"long_term": 0.45, "medium_term": 0.40, "short_term": 0.35},
         thesis={
-            "long_term": "Sentiment mildly positive; no major regulatory risks.",
-            "medium_term": "Sector rotation headwinds noted.",
-            "short_term": "Negative sentiment spike on supply-chain rumour.",
+            "long_term": "Apple's long-term narrative remains intact but faces structural headwinds: iPhone dependency persists, China competition from Huawei intensifies, and Warren Buffett has significantly reduced Berkshire's Apple stake, signaling institutional uncertainty about growth sustainability. However, the company's $500B U.S. investment pledge and services growth provide structural support for eventual recovery.",
+            "medium_term": "Apple trades at elevated risk over the next 3-12 months due to multiple overlapping catalysts: tariff-driven iPhone price increases of ~9%, a 9-10% stock decline from February highs amid market selloff, and DeepSeek AI concerns creating sector-wide pressure. The Siri delay signals competitive vulnerability in AI. Insider selling by Tim Cook at $255-260 precedes this decline, suggesting management awareness of headwinds.",
+            "short_term": "Immediate momentum is sharply bearish following Apple's worst start to a year since 2008. The stock crashed from $238 to $212 (-11%) in just 2 weeks (March 5-14, 2025), with accelerating selling pressure and negative technical signals including MACD and RSI. Heavy volume confirms institutional distribution. Stagflation fears and Magnificent 7 selloff create headwinds for risk assets.",
         },
     )
 
@@ -220,103 +217,13 @@ def _run_analysts_once(
     depth: str,
     horizons: tuple[str, ...],
 ) -> dict:
-    """Run all three analysts once in parallel and return a state dict with real reports.
+    """Return deterministic mock reports for synthesis deviation testing.
 
-    Falls back to mock reports for any analyst that fails.
+    Real analyst runs are skipped so the test isolates synthesis-agent
+    non-determinism from analyst non-determinism.
     """
-    from src.agents.analysts.market_analyst import create_market_analyst
-    from src.agents.analysts.fundamentals_analyst import create_fundamentals_analyst
-    from src.agents.analysts.news_analyst import create_news_analyst
-
-    # Build code agents for market & fundamentals
-    market_ca = CodeValidationAgent(
-        model="minimax-m2.7:cloud",
-        timeout=300,
-        max_iterations=8,
-        analyst_type="market",
-        project_root=_project_root,
-        verbose=False,
-    )
-    fundamentals_ca = CodeValidationAgent(
-        model="minimax-m2.7:cloud",
-        timeout=300,
-        max_iterations=8,
-        analyst_type="fundamental",
-        project_root=_project_root,
-        verbose=False,
-    )
-
-    # Build nodes
-    market_node = create_market_analyst(llm, market_ca, depth, active_horizons=horizons)
-    fundamentals_node = create_fundamentals_analyst(
-        llm, fundamentals_ca, depth, active_horizons=horizons
-    )
-    news_node = create_news_analyst(llm, depth, horizons=horizons)
-
-    init_state = {"company_of_interest": ticker, "trade_date": trade_date}
-
-    def _run_market():
-        try:
-            result = market_node(init_state)
-            report_json = result.get("market_report", "{}")
-            ResearchReport.model_validate_json(report_json)  # sanity check
-            return "market", report_json, None
-        except Exception as exc:
-            return "market", None, exc
-
-    def _run_fundamentals():
-        try:
-            result = fundamentals_node(init_state)
-            report_json = result.get("fundamentals_report", "{}")
-            ResearchReport.model_validate_json(report_json)
-            return "fundamentals", report_json, None
-        except Exception as exc:
-            return "fundamentals", None, exc
-
-    def _run_news():
-        try:
-            result = news_node(init_state)
-            report_json = result.get("news_report", "{}")
-            ResearchReport.model_validate_json(report_json)
-            return "news", report_json, None
-        except Exception as exc:
-            return "news", None, exc
-
-    # Run analysts sequentially to avoid EDGAR thread-safety deadlocks
-    reports: dict[str, str] = {}
-    errors: dict[str, Exception] = {}
-
-    for _run_fn, key in [
-        (_run_market, "market"),
-        (_run_fundamentals, "fundamentals"),
-        (_run_news, "news"),
-    ]:
-        analyst_key, report_json, err = _run_fn()
-        if err:
-            errors[analyst_key] = err
-            _log.warning("%s analyst failed: %s", analyst_key, err)
-        else:
-            reports[analyst_key] = report_json
-
-    # Build final state — use real reports where available, mock fallback otherwise
-    state = {"company_of_interest": ticker, "trade_date": trade_date}
-    mock_fallback = _build_mock_state(ticker, trade_date)
-
-    report_keys = {
-        "market": "market_report",
-        "fundamentals": "fundamentals_report",
-        "news": "news_report",
-    }
-
-    for key in ("market", "fundamentals", "news"):
-        if key in reports:
-            state[report_keys[key]] = reports[key]
-            _log.info("Using REAL %s report", key)
-        else:
-            state[report_keys[key]] = mock_fallback[report_keys[key]]
-            _log.warning("Using MOCK %s report (real run failed)", key)
-
-    return state
+    _log.info("Using MOCK analyst reports for %s @ %s", ticker, trade_date)
+    return _build_mock_state(ticker, trade_date)
 
 
 def _run_once(
@@ -374,7 +281,9 @@ def _run_once(
             "composite": composite,
         }
     except Exception as exc:
-        return {"idx": run_idx, "ok": False, "error": str(exc)}
+        import traceback
+        tb = traceback.format_exc()
+        return {"idx": run_idx, "ok": False, "error": str(exc), "traceback": tb}
 
 
 def _print_summary(results: list[dict], num_runs: int, horizons: tuple[str, ...]):
@@ -613,6 +522,8 @@ def main():
                 results.append(res)
             else:
                 print(f"  Run {idx:02d}/{args.runs}  FAIL  {res['error']}")
+                if res.get("traceback"):
+                    print(f"    TRACEBACK:\n{res['traceback'][:800]}")
 
     _print_summary(results, args.runs, horizons)
     print("\nDone.")

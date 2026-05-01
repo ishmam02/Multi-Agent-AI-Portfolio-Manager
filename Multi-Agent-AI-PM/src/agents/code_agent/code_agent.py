@@ -641,7 +641,9 @@ class CodeValidationAgent:
     @staticmethod
     def _has_result_keys(d: Any) -> bool:
         """Return True if *d* looks like a metrics result dict."""
-        return isinstance(d, dict) and ("mu" in d or "computed_metrics" in d or "horizons" in d)
+        return isinstance(d, dict) and (
+            "mu" in d or "computed_metrics" in d or "horizons" in d
+        )
 
     @staticmethod
     def _extract_result_json(text: str) -> dict | None:
@@ -741,9 +743,13 @@ class CodeValidationAgent:
                 metrics_selected.append(
                     {
                         "metric_name": str(m["metric_name"]),
-                        "metric_interpretation": str(m.get("metric_interpretation", "")),
+                        "metric_interpretation": str(
+                            m.get("metric_interpretation", "")
+                        ),
                         "metric_rationale": str(m.get("metric_rationale", "")),
-                        "computation_instruction": str(m.get("computation_instruction", "")),
+                        "computation_instruction": str(
+                            m.get("computation_instruction", "")
+                        ),
                     }
                 )
         # Support multi-horizon output: pass through "horizons" dict if present
@@ -969,7 +975,7 @@ class CodeValidationAgent:
         if isinstance(active_horizons, (list, tuple)) and len(active_horizons) > 1:
             prompt += (
                 "  5. Print the final result using the MULTI-HORIZON format:\n"
-                '       result = {\n'
+                "       result = {\n"
                 '           "horizons": {\n'
             )
             for h in active_horizons:
@@ -979,10 +985,10 @@ class CodeValidationAgent:
                     f'                   "mu_trace_id": "<uuid4>",\n'
                     f'                   "sigma": <float>,\n'
                     f'                   "sigma_trace_id": "<uuid4>"\n'
-                    f'               }},\n'
+                    f"               }},\n"
                 )
             prompt += (
-                '           },\n'
+                "           },\n"
                 '           "computed_metrics": computed_metrics,   # each entry MUST include "term": "long_term" etc.\n'
                 '           "computation_traces": computation_traces,\n'
                 '           "metrics_selected": metrics_selected,\n'
@@ -990,7 +996,12 @@ class CodeValidationAgent:
                 "       print(json.dumps(result, indent=2))\n"
             )
         else:
-            h = active_horizons[0] if isinstance(active_horizons, (list, tuple)) and len(active_horizons) == 1 else "long_term"
+            h = (
+                active_horizons[0]
+                if isinstance(active_horizons, (list, tuple))
+                and len(active_horizons) == 1
+                else "long_term"
+            )
             prompt += (
                 "  5. Print the final result using the SINGLE-HORIZON format:\n"
                 "       result = {\n"
@@ -1119,7 +1130,9 @@ class CodeValidationAgent:
                             try:
                                 for raw_bytes in proc.stdout:
                                     if isinstance(raw_bytes, bytes):
-                                        line_q.put(raw_bytes.decode("utf-8", errors="replace"))
+                                        line_q.put(
+                                            raw_bytes.decode("utf-8", errors="replace")
+                                        )
                                     else:
                                         line_q.put(raw_bytes)
                             finally:
@@ -1320,6 +1333,24 @@ class CodeValidationAgent:
         self._log(
             "EXTRACT", f"result_text={len(result_text)} chars  work_dir={work_dir}"
         )
+        # ── Guard: detect unmodified stub ──────────────────────────────────
+        metrics_path = os.path.join(work_dir, "metrics.py")
+        is_stub = False
+        if os.path.isfile(metrics_path):
+            try:
+                with open(metrics_path, encoding="utf-8") as fh:
+                    src = fh.read()
+                is_stub = "# TODO: replace with real implementation" in src
+            except Exception:
+                pass
+        if is_stub:
+            self._log(
+                "EXTRACT",
+                "metrics.py is still the unmodified stub — agent never wrote code",
+            )
+            return self._failure_fallback(
+                "Code agent did not write metrics.py (still stub)"
+            )
 
         # ── Tier 1: re-run metrics.py deterministically ──────────────────────
         stdout, stderr, rc = self._rerun_metrics_file(work_dir)
