@@ -26,7 +26,6 @@ from rich.rule import Rule
 from src.graph.trading_graph import TradingGraph
 from src.default_config import DEFAULT_CONFIG
 from cli.utils import *
-from cli.announcements import fetch_announcements, display_announcements
 from cli.stats_handler import StatsCallbackHandler
 from cli.saved_config import save_config, load_config, format_config_summary
 from src.graph.stock_screener import StockScreener
