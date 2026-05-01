@@ -1,4 +1,4 @@
-# TradingAgents/graph/signal_processing.py
+# src/graph/signal_processing.py
 """Deterministic signal processing and trade proposal based on CompositeSignal.
 
 Replaces LLM-based trade planning with reproducible math:

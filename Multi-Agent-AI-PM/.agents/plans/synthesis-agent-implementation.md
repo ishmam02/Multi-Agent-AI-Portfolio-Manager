@@ -25,7 +25,7 @@ Introduce a `create_synthesis_agent(llm, code_agent, memory)` factory that:
 2. Uses the LLM for Phase 1 (dynamic weight assignment + rationale) and Phase 2 (cross-signal contradiction detection).
 3. Uses the `code_agent` for Phase 3 (deterministic composite mu/sigma math + PSD validation).
 4. Returns a JSON-serialized `CompositeSignal` written to `AgentState.composite_signal`.
-5. Adds multi-ticker covariance post-processing in `TradingAgentsGraph.propagate_multi()`.
+5. Adds multi-ticker covariance post-processing in `TradingGraph.propagate_multi()`.
 
 ## Feature Metadata
 - **Type**: Enhancement / Refactor
@@ -57,7 +57,7 @@ Introduce a `create_synthesis_agent(llm, code_agent, memory)` factory that:
 - `src/agents/analysts/base_analyst.py` (lines 1653–1806) — Why: `create_analyst_node` returns `{state_key: report.model_dump_json()}`. The synthesis agent must deserialize these JSON strings back into `ResearchReport`.
 - `src/agents/code_agent/code_agent.py` (lines 1–150) — Why: `CodeValidationAgent.execute_plan()` signature and return format. The synthesis agent invokes the code_agent for Phase 3 math validation.
 - `src/graph/setup.py` (lines 1–134) — Why: Graph wiring. `create_trader` is called here; must swap in `create_synthesis_agent` and pass a `code_agent`.
-- `src/graph/trading_graph.py` (lines 1–459) — Why: `TradingAgentsGraph.__init__` creates code agents, `_log_state` logs `trader_investment_plan`, `propagate` returns signal, `propagate_multi` runs parallel tickers.
+- `src/graph/trading_graph.py` (lines 1–459) — Why: `TradingGraph.__init__` creates code agents, `_log_state` logs `trader_investment_plan`, `propagate` returns signal, `propagate_multi` runs parallel tickers.
 - `src/graph/conditional_logic.py` (lines 1–60) — Why: Conditional edge routing logic. Will be simplified since sub-graphs are self-contained.
 - `src/graph/propagation.py` (lines 1–49) — Why: `create_initial_state` initializes `trader_investment_plan`.
 - `src/graph/signal_processing.py` (lines 1–442) — Why: `SignalProcessor` and `propose_portfolio_trades` reference `trader_investment_plan`. These must read `composite_signal` instead.
@@ -319,7 +319,7 @@ Execute every task in order. Each task is atomic and independently testable.
     5. Return the dict.
     
     Call this method at the end of `propagate_multi()` after all results are collected, and attach the covariance dict under a new key in the returned dict (or store it as an instance attribute).
-- **VALIDATE**: `python -c "from src.graph.trading_graph import TradingAgentsGraph; print('import ok')"`
+- **VALIDATE**: `python -c "from src.graph.trading_graph import TradingGraph; print('import ok')"`
 
 ### Task 8: UPDATE initial state in `src/graph/propagation.py`
 - **IMPLEMENT**:
@@ -381,7 +381,7 @@ Execute every task in order. Each task is atomic and independently testable.
 ### Task 13: HANDLE the deleted `social_media_analyst.py`
 - **IMPLEMENT**: The working tree has `src/agents/analysts/social_media_analyst.py` deleted, but `setup.py` still calls `create_social_media_analyst`. This will cause `ImportError` on graph setup. Either:
   - **Option A**: Restore the file from git (`git checkout HEAD -- src/agents/analysts/social_media_analyst.py`), or
-  - **Option B**: Remove `"social"` from the default `selected_analysts` in `TradingAgentsGraph.__init__` and `setup_graph()`, and update `src/agents/__init__.py` to remove the import.
+  - **Option B**: Remove `"social"` from the default `selected_analysts` in `TradingGraph.__init__` and `setup_graph()`, and update `src/agents/__init__.py` to remove the import.
   
   **Recommended**: Option A (restore the file) unless the user explicitly wants it gone. The feature spec assumes 4 analysts exist. Add a note in the plan.
 - **VALIDATE**: `python -c "from src.agents import create_social_media_analyst; print('ok')"` (if restoring) or ensure no import errors if removing.
@@ -439,7 +439,7 @@ python -m pytest tests/ -x -q --tb=short
 ### Level 3: Integration / Smoke Test
 ```bash
 python -c "
-from src.graph.trading_graph import TradingAgentsGraph
+from src.graph.trading_graph import TradingGraph
 from src.agents.utils.schemas import CompositeSignal
 import json
 
@@ -447,7 +447,7 @@ import json
 print('Schemas OK')
 
 # Verify graph can be instantiated (won't run without API keys)
-# graph = TradingAgentsGraph(selected_analysts=['market', 'fundamentals'])
+# graph = TradingGraph(selected_analysts=['market', 'fundamentals'])
 # print('Graph init OK')
 "
 ```

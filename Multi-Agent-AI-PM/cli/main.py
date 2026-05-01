@@ -23,7 +23,7 @@ from rich import box
 from rich.align import Align
 from rich.rule import Rule
 
-from src.graph.trading_graph import TradingAgentsGraph
+from src.graph.trading_graph import TradingGraph
 from src.default_config import DEFAULT_CONFIG
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -923,7 +923,7 @@ def run_analysis():
     selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
 
     # Initialize the graph with callbacks bound to LLMs
-    graph = TradingAgentsGraph(
+    graph = TradingGraph(
         selected_analyst_keys,
         user_risk_profile,
         config=config,
@@ -1230,7 +1230,7 @@ def run_multi_analysis(selections):
     selected_set = {analyst.value for analyst in selections["analysts"]}
     selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
 
-    graph = TradingAgentsGraph(
+    graph = TradingGraph(
         selected_analyst_keys,
         user_risk_profile,
         config=config,

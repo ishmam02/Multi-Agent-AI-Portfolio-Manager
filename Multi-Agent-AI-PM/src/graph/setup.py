@@ -1,4 +1,4 @@
-# TradingAgents/graph/setup.py
+# src/graph/setup.py
 
 import time
 from typing import Dict, Any

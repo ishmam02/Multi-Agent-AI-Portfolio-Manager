@@ -1,5 +1,5 @@
 """
-System-level regime-aware backtest for TradingAgentsGraph.
+System-level regime-aware backtest for the multi-agent trading graph.
 
 Runs the full multi-agent graph on historical dates sampled across market regimes,
 then compares predicted mu / conviction against realized forward returns at
@@ -34,7 +34,7 @@ from src.backtest._proc_utils import (  # noqa: E402
     init_worker_process_group,
     install_executor_cleanup,
 )
-from src.graph.trading_graph import TradingAgentsGraph  # noqa: E402
+from src.graph.trading_graph import TradingGraph  # noqa: E402
 
 
 # ── Regime definitions (label, start, end, samples) ──────────────────────────
@@ -159,7 +159,7 @@ def run_single(
     regime: str,
     config: Dict,
 ) -> Tuple[BacktestResult, Optional[Dict[str, Any]]]:
-    """Run the full TradingAgentsGraph for one date.
+    """Run the full multi-agent graph for one date.
 
     Returns:
         (BacktestResult, final_state_dict | None)
@@ -171,7 +171,7 @@ def run_single(
 
     try:
         # Each thread gets its own graph instance to avoid shared-state issues
-        graph = TradingAgentsGraph(
+        graph = TradingGraph(
             selected_analysts=["market", "fundamentals", "news"],
             config=config,
             debug=False,
@@ -500,7 +500,7 @@ def _capture_report_text(results: List[BacktestResult]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Backtest the full TradingAgentsGraph across market regimes."
+        description="Backtest the full multi-agent trading graph across market regimes."
     )
     parser.add_argument("--ticker", default="SPY", help="Comma-separated tickers to backtest")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

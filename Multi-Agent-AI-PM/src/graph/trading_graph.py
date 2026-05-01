@@ -1,4 +1,5 @@
-# TradingAgents/graph/trading_graph.py
+# src/graph/trading_graph.py
+# Multi-agent trading graph orchestration.
 
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ from src.graph.stock_screener import StockScreener
 from src.dataflows.alpaca import get_open_positions
 
 
-class TradingAgentsGraph:
+class TradingGraph:
     """Main class that orchestrates the trading agents framework."""
 
     def __init__(
@@ -452,7 +453,7 @@ class TradingAgentsGraph:
 
             # Save to file (per-ticker directory)
             if ticker:
-                directory = Path(f"eval_results/{ticker}/TradingAgentsStrategy_logs/")
+                directory = Path(f"eval_results/{ticker}/strategy_logs/")
                 directory.mkdir(parents=True, exist_ok=True)
                 with open(directory / f"full_states_log_{trade_date}.json", "w") as f:
                     json.dump(self.log_states_dict, f, indent=4)

@@ -1,4 +1,4 @@
-# TradingAgents/graph/propagation.py
+# src/graph/propagation.py
 
 from typing import Dict, Any, List, Optional
 from src.agents.utils.agent_states import (
